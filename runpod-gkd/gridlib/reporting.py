@@ -65,15 +65,20 @@ def estimate(root, selected, settings):
                      "estimated_initialization_seconds": startup,
                      "estimated_evaluation_seconds": baseline["evaluation_seconds"],
                      "estimated_total_seconds": seconds + saves * save_time + startup + baseline["wall_seconds"]})
+    from .recovery import training_microbatch
+    active = training_microbatch(root, selected)
     return {"basis": "Measured joint-fit pilot on the actual GPU plus full common-baseline validation",
             "pilot_sha256": sha256(root / "pilot.json"), "cells": rows,
+            "pilot_microbatch": selected["microbatch"], "active_training_microbatch": active,
+            "forecast_stale_after_oom": active != selected["microbatch"],
             "training_hours": sum(x["estimated_training_seconds"] for x in rows) / 3600,
             "evaluation_hours": sum(x["estimated_evaluation_seconds"] for x in rows) / 3600,
             "total_grid_hours": sum(x["estimated_total_seconds"] for x in rows) / 3600,
             "baseline_already_spent_hours": baseline["wall_seconds"] / 3600,
             "warning": "Projection, not a time/billing cap. Online pilot forces 64 tokens; actual generation lengths "
                        "and mixed-batch overhead vary. Pilot costs, failures/replayed work and storage excluded. "
-                       "Full-grid forecast, not remaining-time forecast after a partial grid."}
+                       "Full-grid forecast, not remaining-time forecast after a partial grid. "
+                       "After OOM batch reduction this remains the ORIGINAL pilot forecast, not a fresh throughput measurement."}
 
 
 def records(path):
@@ -111,6 +116,8 @@ def summary(root):
         if pointer.exists():
             evaluation = read_json(Path(read_json(pointer)["path"]) / "metrics.json")
         events = [event for path in sorted((run_dir / "sessions").glob("*.jsonl")) for event in records(path)]
+        batch_sessions = [event["microbatch"] for event in sorted(events, key=lambda e: e.get("unix_time", 0))
+                          if event["event"] == "initialized" and "microbatch" in event]
         own_stages = [x for x in stages if x["cell"] == item["id"]]
         train_wall = sum(x["seconds"] for x in own_stages if x["operation"] == "train")
         eval_wall = sum(x["seconds"] for x in own_stages if x["operation"] == "evaluate")
@@ -125,11 +132,16 @@ def summary(root):
                "points": training.get("points"), "on_policy_examples": training.get("on_policy_examples"),
                "off_policy_examples": training.get("off_policy_examples"), "updates": training.get("step"),
                "source_tokens": training.get("source_tokens"), "target_tokens": training.get("target_tokens"),
+               "microbatch": training.get("microbatch"), "session_microbatches": batch_sessions,
                "training_seconds": training.get("training_seconds"),
                "recorded_update_seconds_including_replay": sum(e.get("training_seconds", 0)
                                                               for e in events if e["event"] == "update"),
                "training_wall_seconds": train_wall,
                "evaluation_seconds": evaluation.get("evaluation_seconds"),
+               "evaluation_batch_size": read_json(Path(read_json(pointer)["path"]) / "COMPLETE.json")
+                                        .get("identity", {}).get("batch_size") if pointer.exists() else None,
+               "evaluation_batching_recovery": read_json(run_dir / "evaluation_batching.json")
+                                               if (run_dir / "evaluation_batching.json").exists() else None,
                "evaluation_wall_seconds": eval_wall,
                "total_stage_wall_seconds": train_wall + eval_wall,
                "rouge1": evaluation.get("scores", {}).get("rouge1"),
@@ -143,6 +155,8 @@ def summary(root):
               "complete_cells": sum(x["status"] == "complete" for x in rows),
               "unmeasured_interrupted_stages": unmeasured,
               "shared_stage_wall_seconds": sum(x["seconds"] for x in stages if x["cell"] == "shared"),
+              "oom_training_recovery": read_json(root / "training_batching.json")
+                                      if (root / "training_batching.json").exists() else None,
               "time_accounting": "training_seconds = committed synchronized update time including generation/scoring/backward. "
                                  "Stage wall includes initialization/checkpoint/evaluation and recorded failed attempts. "
                                  "Shared pilot/baseline/controller overhead is separate; killed controllers may leave unmeasured stages."}

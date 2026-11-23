@@ -31,6 +31,7 @@ def main():
         worker.add_argument("--online", type=int, choices=[0, 1])
         worker.add_argument("--output", type=Path)
         worker.add_argument("--session-updates", type=int)
+        worker.add_argument("--attempt-result", type=Path)
     args = parser.parse_args()
     operation = args.command or "plan"
     settings = policy.settings(args.settings)
@@ -94,25 +95,41 @@ def main():
             pilot_worker(root, bound, args.microbatch, bool(args.online), args.output.resolve())
         elif operation in ("_train", "_evaluate"):
             from gridlib.controller import saved_pilot
+            from gridlib.recovery import (OOM_EXIT_CODE, evaluation_microbatch, training_microbatch)
             selected = saved_pilot(root)
             item = next((x for x in policy.cells() if x["id"] == args.cell), None)
             if item is None and not (operation == "_evaluate" and args.cell == "baseline"):
                 raise ValueError("Explicit grid cell required")
-            if operation == "_train":
-                from gridlib.engine import train
-                if args.session_updates is not None and args.session_updates < 1:
-                    raise ValueError("Session pilot update cap must be positive")
-                train(root, bound, item, selected, args.session_updates)
-            else:
-                from gridlib.evaluation import evaluate
-                if args.output is None:
-                    raise ValueError("Explicit evaluation output required")
-                output = args.output.resolve()
-                owner = root / "cells" / item["id"] if item else root / "baseline"
-                if not output.is_relative_to(owner):
-                    raise ValueError("Evaluation must stay within its own cell/baseline directory")
-                evaluate(root, bound, item, selected, output)
-                atomic_json(owner / "latest_evaluation.json", {"path": str(output)})
+            if args.attempt_result is not None and not args.attempt_result.resolve().is_relative_to(root / "attempts"):
+                raise ValueError("Attempt reports must stay inside this grid's attempts directory")
+            actual_batch = (training_microbatch(root, selected) if operation == "_train"
+                            else evaluation_microbatch(root, bound, item, selected))
+            if args.microbatch is not None and args.microbatch != actual_batch:
+                raise ValueError("Worker microbatch differs from the recorded active batching policy")
+            import torch
+            try:
+                if operation == "_train":
+                    from gridlib.engine import train
+                    if args.session_updates is not None and args.session_updates < 1:
+                        raise ValueError("Session pilot update cap must be positive")
+                    train(root, bound, item, selected, args.session_updates, microbatch=actual_batch)
+                else:
+                    from gridlib.evaluation import evaluate
+                    if args.output is None:
+                        raise ValueError("Explicit evaluation output required")
+                    output = args.output.resolve()
+                    owner = root / "cells" / item["id"] if item else root / "baseline"
+                    if not output.is_relative_to(owner):
+                        raise ValueError("Evaluation must stay within its own cell/baseline directory")
+                    evaluate(root, bound, item, selected, output)
+                    atomic_json(owner / "latest_evaluation.json", {"path": str(output)})
+            except torch.cuda.OutOfMemoryError as error:
+                if args.attempt_result is None:
+                    raise
+                atomic_json(args.attempt_result.resolve(),
+                            {"status": "cuda_oom", "operation": operation[1:], "cell": args.cell,
+                             "microbatch": actual_batch, "error": str(error)})
+                raise SystemExit(OOM_EXIT_CODE)
 
 
 if __name__ == "__main__":

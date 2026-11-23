@@ -9,6 +9,7 @@ import uuid
 from . import checkpoints, data, modeling
 from .core import (STEPS, atomic_json, check_space, code_signature, environment, read_json, sha256,
                    sync_directory, sync_tree, tree_manifest, verify_tree)
+from .resume import config_compatible
 
 
 def export_path(work, value, step=None):
@@ -43,7 +44,7 @@ def export(work, value, allow_partial=False):
     from safetensors.torch import save_file
     run_dir = work / "runs" / value["run_name"]
     run = read_json(run_dir / "run.json")
-    if run["config"] != value:
+    if not config_compatible(run["config"], value):
         raise ValueError("Export configuration changed")
     checkpoint = checkpoints.resolve(run_dir)
     marker = checkpoints.verify(checkpoint, run["run_id"])
@@ -108,7 +109,7 @@ def export(work, value, allow_partial=False):
 def verify_evaluation(work, value, directory, export_dir, expected_n):
     settings = read_json(directory / "settings.json")
     metrics = read_json(directory / "metrics.json")
-    if (settings["config"] != value or settings["export_complete_sha256"] != sha256(export_dir / "COMPLETE.json")
+    if (not config_compatible(settings["config"], value) or settings["export_complete_sha256"] != sha256(export_dir / "COMPLETE.json")
             or settings["prepared_manifest_sha256"] != sha256(work / "prepared/manifest.json")
             or metrics["status"] != "complete" or metrics["split"] != "validation" or metrics["n"] != expected_n
             or sha256(directory / "predictions.jsonl") != metrics["predictions_sha256"]):
@@ -125,7 +126,7 @@ def evaluate(work, value, output, limit=0):
     marker = verify_export(export_dir)
     provenance = read_json(export_dir / "provenance.json")
     if (marker["role"] != value["role"] or marker["step"] != value["max_steps"]
-            or provenance["source_run"]["config"] != value or provenance["partial"]):
+            or not config_compatible(provenance["source_run"]["config"], value) or provenance["partial"]):
         raise ValueError("Evaluate the complete matching role/config export")
     data.verify(work, value)
     count = limit or data.COUNTS["validation"]

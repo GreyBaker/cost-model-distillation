@@ -12,6 +12,7 @@ import uuid
 
 from . import assets, checkpoints, data, inference
 from .core import ROOT, SPEC, RunLock, atomic_json, code_signature, config, read_json, sha256
+from .resume import config_compatible, record_migration
 
 ORDER = ("student", "teacher")
 
@@ -26,7 +27,7 @@ def training_complete(work, value):
     run = read_json(run_dir / "run.json")
     checkpoint = checkpoints.resolve(run_dir)
     marker = checkpoints.verify(checkpoint, run["run_id"])
-    return run["config"] == value and marker["step"] == value["max_steps"]
+    return config_compatible(run["config"], value) and marker["step"] == value["max_steps"]
 
 
 class ChildStop:
@@ -63,8 +64,14 @@ def run(root, config_dir):
     root.mkdir(parents=True, exist_ok=True)
     with RunLock(root / ".sequence.lock"):
         path = root / "sequence.json"
-        if path.exists() and read_json(path) != definition:
-            raise ValueError("Sequence/config/code changed; use a new work directory, not a silent migration")
+        if path.exists():
+            saved = read_json(path)
+            if (set(saved) != set(definition)
+                    or any(saved[k] != definition[k] for k in definition if k not in ("configs", "code"))
+                    or set(saved["configs"]) != set(values)
+                    or any(not config_compatible(saved["configs"][role], values[role]) for role in ORDER)):
+                raise ValueError("Sequence effective batch/recipe changed; use a new work directory")
+            record_migration(root / "migrations", saved, definition)
         if not path.exists():
             atomic_json(path, definition)
         # Fail before a lengthy student run if teacher inputs were not prepared.

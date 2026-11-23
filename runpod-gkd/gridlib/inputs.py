@@ -5,6 +5,7 @@ from pathlib import Path
 
 from .policy import PROTOCOL, code_signature
 from .shared import SFT_CODE, atomic_json, checkpoints, read_json, sha256
+from sftlib.resume import record_migration
 
 
 def separate_work(root, sft_work):
@@ -80,8 +81,12 @@ def binding(root, sft_work, settings, create=False, full=True):
                   "protocol": PROTOCOL, "code": code_signature()}
     path = root / "binding.json"
     if path.exists():
-        if read_json(path) != definition:
-            raise ValueError("Bound SFT inputs/code/settings changed. Use a new grid directory.")
+        saved = read_json(path)
+        if ({k: v for k, v in saved.items() if k != "code"}
+                != {k: v for k, v in definition.items() if k != "code"}):
+            raise ValueError("Bound SFT inputs/settings changed. Use a new grid directory.")
+        if create or full:
+            record_migration(root / "code_migrations", {"code": saved["code"]}, {"code": definition["code"]})
     elif create:
         root.mkdir(parents=True, exist_ok=True)
         atomic_json(path, definition)

@@ -13,6 +13,8 @@ from . import evaluation, reporting
 from .policy import ROOT, cells
 from .shared import atomic_json, checkpoints, read_json, sha256
 from .engine import append, check_state
+from .recovery import (CudaOOM, OOM_EXIT_CODE, evaluation_microbatch, evaluation_path,
+                       lower, train_with_recovery)
 
 
 def command(root, sft_work, settings_path, operation, *extra):
@@ -32,13 +34,17 @@ class Runner:
         log = logs / f"{cell_id}-{operation}-{time.time_ns()}.log"
         started = time.monotonic()
         code = None
+        attempt = self.root / "attempts" / (uuid.uuid4().hex + ".json")
         append(self.root / "stage_starts.jsonl",
                {"cell": cell_id, "operation": operation, "log": str(log), "unix_time": time.time()})
         print(json.dumps({"cell": cell_id, "operation": operation, "log": str(log)}), flush=True)
         try:
             with log.open("x", encoding="utf-8") as stream:
+                worker_extra = [*extra]
+                if operation in ("train", "evaluate"):
+                    worker_extra += ["--attempt-result", str(attempt)]
                 self.stop.child = subprocess.Popen(
-                    command(self.root, self.sft_work, self.settings_path, "_" + operation, *extra),
+                    command(self.root, self.sft_work, self.settings_path, "_" + operation, *worker_extra),
                     cwd=ROOT, stdout=stream, stderr=subprocess.STDOUT,
                     start_new_session=os.name != "nt",
                     env={**os.environ, "PYTHONUNBUFFERED": "1", "TOKENIZERS_PARALLELISM": "false"})
@@ -48,6 +54,13 @@ class Runner:
                 code = self.stop.child.wait()
                 self.stop.child = None
             if code and not self.stop.requested:
+                if code == OOM_EXIT_CODE and attempt.is_file() and operation in ("train", "evaluate"):
+                    report = read_json(attempt)
+                    expected_cell = str(extra[extra.index("--cell") + 1])
+                    expected_batch = int(extra[extra.index("--microbatch") + 1])
+                    if (report.get("status") == "cuda_oom" and report.get("operation") == operation
+                            and report.get("cell") == expected_cell and report.get("microbatch") == expected_batch):
+                        raise CudaOOM({**report, "attempt_result": str(attempt), "log": str(log)})
                 raise RuntimeError(f"{cell_id} {operation} failed: inspect {log}")
             return not self.stop.requested
         finally:
@@ -69,6 +82,20 @@ def saved_pilot(root):
 
 
 def ensure_evaluation(root, bound, item, selected, runner):
+    while True:
+        try:
+            return evaluation_attempt(root, bound, item, selected, runner)
+        except CudaOOM as error:
+            if item is not None:
+                from .recovery import checkpoint_for_retry
+                checkpoint_for_retry(root, item)
+            initial = min(selected["microbatch"], bound["settings"]["evaluation_batch_cap"])
+            lower(root, evaluation_path(root, item), initial,
+                  evaluation_microbatch(root, bound, item, selected),
+                  cell=item["id"] if item else "baseline", failure=error.report)
+
+
+def evaluation_attempt(root, bound, item, selected, runner):
     owner = root / "cells" / item["id"] if item else root / "baseline"
     owner.mkdir(parents=True, exist_ok=True)
     pointer = owner / "latest_evaluation.json"
@@ -85,7 +112,8 @@ def ensure_evaluation(root, bound, item, selected, runner):
             return True
         output = owner / ("evaluation-retry-" + uuid.uuid4().hex)
     return runner.call("evaluate", item["id"] if item else "shared",
-                       "--cell", item["id"] if item else "baseline", "--output", output)
+                       "--cell", item["id"] if item else "baseline", "--output", output,
+                       "--microbatch", evaluation_microbatch(root, bound, item, selected))
 
 
 def check_completed_training(root, bound, item, selected):
@@ -179,7 +207,7 @@ def run(root, bound, settings_path):
             if stop.requested:
                 break
             if not check_completed_training(root, bound, item, selected):
-                if not runner.call("train", item["id"], "--cell", item["id"]):
+                if not train_with_recovery(root, item, selected, runner):
                     break
                 if not check_completed_training(root, bound, item, selected):
                     break

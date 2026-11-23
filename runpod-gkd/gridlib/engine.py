@@ -15,7 +15,7 @@ from .shared import Cursor, atomic_json, checkpoints, read_json, sha256
 def append(path, record):
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as stream:
-        stream.write(json.dumps(record, allow_nan=False) + "\n")
+        stream.write(json.dumps({"unix_time": time.time(), **record}, allow_nan=False) + "\n")
         stream.flush()
 
 
@@ -37,12 +37,15 @@ def check_state(state, item):
         raise ValueError("Checkpoint point/mixture/data-cursor accounting differs")
 
 
-def train(root, bound, item, selected, session_updates=None):
+def train(root, bound, item, selected, session_updates=None, microbatch=None):
     started = time.monotonic()
     import torch
     from sftlib.training import StopRequest, seed, rng_state, restore_rng
     from . import backend
     settings = bound["settings"]
+    microbatch = selected["microbatch"] if microbatch is None else microbatch
+    if type(microbatch) is not int or not 1 <= microbatch <= selected["microbatch"] or 32 % microbatch:
+        raise ValueError("Microbatch must be a positive divisor of 32 no larger than the original pilot selection")
     run_dir = root / "cells" / item["id"]
     run_file = run_dir / "run.json"
     value = {"cell": item, "microbatch": selected["microbatch"], "settings": settings,
@@ -79,6 +82,13 @@ def train(root, bound, item, selected, session_updates=None):
     branch_rng = random.Random(settings["seed"] + 2)
     if checkpoint:
         loaded = torch.load(checkpoint / "training_state.pt", map_location="cpu", weights_only=True)
+        execution = loaded.get("execution_config", value)
+        saved_batch = execution.get("microbatch")
+        if ({k: v for k, v in execution.items() if k != "microbatch"}
+                != {k: v for k, v in value.items() if k != "microbatch"}
+                or type(saved_batch) is not int or not 1 <= saved_batch <= selected["microbatch"]
+                or 32 % saved_batch):
+            raise ValueError("Checkpoint execution recipe/effective-batch partition is invalid")
         opt.load_state_dict(loaded["optimizer"])
         state = loaded["accounting"]
         check_state(state, item)
@@ -90,7 +100,8 @@ def train(root, bound, item, selected, session_updates=None):
         del loaded
     session = run_dir / "sessions" / (uuid.uuid4().hex + ".jsonl")
     append(session, {"event": "initialized", "seconds": time.monotonic() - started,
-                     "step": state["step"], "from_checkpoint": str(checkpoint) if checkpoint else None})
+                     "step": state["step"], "from_checkpoint": str(checkpoint) if checkpoint else None,
+                     "microbatch": microbatch, "effective_batch_size": 32})
     last_saved = state["step"] if checkpoint else -1
     start_step = state["step"]
 
@@ -102,14 +113,16 @@ def train(root, bound, item, selected, session_updates=None):
         checkpoints.save(run_dir, student, tokenizer,
                          {"step": state["step"], "accounting": dict(state),
                           "optimizer": opt.state_dict(), "rng": rng_state(),
-                          "branch_rng": branch_rng.getstate()}, reason)
+                           "branch_rng": branch_rng.getstate(),
+                           "execution_config": {**value, "microbatch": microbatch}}, reason)
         last_saved = state["step"]
         append(session, {"event": "checkpoint", "step": last_saved,
                          "seconds": time.monotonic() - before})
         atomic_json(run_dir / "training_summary.json",
                     {"status": "paused", "cell": item, **state,
                      "checkpoint": str(checkpoints.resolve(run_dir)),
-                     "initial_student": run["initial_student"], "signatures": signatures})
+                     "initial_student": run["initial_student"], "signatures": signatures,
+                     "microbatch": microbatch})
 
     try:
         torch.cuda.reset_peak_memory_stats(device)
@@ -124,7 +137,7 @@ def train(root, bound, item, selected, session_updates=None):
                 rows = [datasets["train"][i] for i in cursor.take(spec["examples"])]
                 flags = [True] * spec["on"] + [False] * spec["off"]
                 branch_rng.shuffle(flags)
-                batches = chunks(rows, flags, selected["microbatch"], branch_rng)
+                batches = chunks(rows, flags, microbatch, branch_rng)
                 rate = settings["learning_rate"] * lr_factor(state["points"], spec["points"], item["points"])
                 for group in opt.param_groups:
                     group["lr"] = rate
@@ -140,7 +153,8 @@ def train(root, bound, item, selected, session_updates=None):
                     state[key] += result[key]
                 check_state(state, item)
                 append(session, {"event": "update", "step": state["step"], "points": state["points"],
-                                 "on": spec["on"], "off": spec["off"], "learning_rate": rate, **result})
+                                 "on": spec["on"], "off": spec["off"], "learning_rate": rate,
+                                 "microbatch": microbatch, "microbatches": len(batches), **result})
                 print(json.dumps({"cell": item["id"], "step": state["step"], "points": state["points"],
                                   "training_seconds": state["training_seconds"], "loss": result["loss"]}), flush=True)
                 stopping = stop.requested or (session_updates is not None
@@ -154,7 +168,8 @@ def train(root, bound, item, selected, session_updates=None):
         atomic_json(run_dir / "training_summary.json",
                     {"status": status, "cell": item, **state,
                      "checkpoint": str(checkpoints.resolve(run_dir)),
-                     "initial_student": run["initial_student"], "signatures": signatures})
+                     "initial_student": run["initial_student"], "signatures": signatures,
+                     "microbatch": microbatch})
     except BaseException as error:
         atomic_json(run_dir / "failure.json", {"error": str(error), "last_saved_step": last_saved,
                     "recovery": "Resume only this cell's latest COMPLETE checkpoint; preserve incomplete files."})

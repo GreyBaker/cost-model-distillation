@@ -8,6 +8,7 @@ import uuid
 
 from . import assets, checkpoints, data, modeling
 from .core import Cursor, atomic_json, checkpoint_due, code_signature, environment, lr_for_update, read_json, sha256
+from .resume import config_compatible, record_migration, signatures_compatible
 
 
 def seed(value):
@@ -100,10 +101,14 @@ def train(work, value, resume=None, session_updates=None):
     checkpoint = None
     if resume:
         run = read_json(run_dir / "run.json")
-        if run["config"] != value or run["signatures"] != signatures or run["runtime"] != runtime:
-            raise ValueError("Resume refused: config, code, assets/data, software or GPU changed")
+        if (not config_compatible(run["config"], value)
+                or not signatures_compatible(run["signatures"], signatures) or run["runtime"] != runtime):
+            raise ValueError("Resume refused: effective batch, recipe, assets/data, software or GPU changed")
         checkpoint = checkpoints.resolve(run_dir, resume)
         marker = checkpoints.verify(checkpoint, run["run_id"])
+        record_migration(run_dir / "migrations",
+                         {"config": run["config"], "signatures": run["signatures"]},
+                         {"config": value, "signatures": signatures}, checkpoint)
         if marker["step"] >= value["max_steps"]:
             print("This role already completed its full update budget; no training run.")
             return
@@ -118,7 +123,8 @@ def train(work, value, resume=None, session_updates=None):
     log_dir.mkdir(exist_ok=True)
     log_path = log_dir / f"{session_id}.jsonl"
     atomic_json(log_dir / f"{session_id}.json", {"checkpoint": str(checkpoint) if checkpoint else None,
-                "session_updates": session_updates, "runtime": runtime})
+                "session_updates": session_updates, "runtime": runtime,
+                "execution_config": value, "execution_signatures": signatures})
     atomic_json(run_dir / "status.json", {"status": "initializing", "session_id": session_id})
     seed(value["seed"])
     tokenizer, model = modeling.load(checkpoint or work / "assets/model", device, True, value)
@@ -130,6 +136,10 @@ def train(work, value, resume=None, session_updates=None):
     step, tokens_seen = 0, {"source": 0, "target": 0}
     if checkpoint:
         state = torch.load(checkpoint / "training_state.pt", map_location="cpu", weights_only=True)
+        if not config_compatible(state.get("execution_config", run["config"]), value):
+            raise ValueError("Saved execution configuration is not batch-partition compatible")
+        if not signatures_compatible(state.get("execution_signatures", run["signatures"]), signatures):
+            raise ValueError("Saved execution assets/data are not compatible")
         optimizer.load_state_dict(state["optimizer"])
         step = state["step"]
         cursor.position = state["cursor"]
@@ -158,7 +168,8 @@ def train(work, value, resume=None, session_updates=None):
         if last_saved != step:
             before = time.monotonic()
             checkpoints.save(run_dir, model, tokenizer, {"step": step, "cursor": cursor.position,
-                             "tokens_seen": dict(tokens_seen), "optimizer": optimizer.state_dict(), "rng": rng_state()}, reason)
+                             "tokens_seen": dict(tokens_seen), "optimizer": optimizer.state_dict(), "rng": rng_state(),
+                             "execution_config": value, "execution_signatures": signatures}, reason)
             last_saved = step
             log({"event": "checkpoint", "step": step, "seconds": time.monotonic() - before, "reason": reason})
 

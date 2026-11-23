@@ -72,7 +72,9 @@ def save(run_dir, model, tokenizer, state, reason):
     tokenizer.save_pretrained(temporary)
     torch.save(state, temporary / "training_state.pt")
     atomic_json(temporary / "metadata.json", {"run_id": run["run_id"], "step": step, "reason": reason,
-                                             "config": run["config"], "signatures": run["signatures"]})
+                                             "config": run["config"], "signatures": run["signatures"],
+                                             "execution_config": state.get("execution_config", run["config"]),
+                                             "execution_signatures": state.get("execution_signatures", run["signatures"])})
     sync_tree(temporary)
     files = tree_manifest(temporary)
     atomic_json(temporary / "COMPLETE.json", {"run_id": run["run_id"], "step": step, "files": files})

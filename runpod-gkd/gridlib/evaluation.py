@@ -39,11 +39,11 @@ def source(root, bound, item):
 
 
 def identity(root, bound, item, selected):
+    from .recovery import evaluation_microbatch
     directory = source(root, bound, item)
     return {"source_complete_sha256": sha256(directory / "COMPLETE.json"),
             "binding_sha256": sha256(root / "binding.json"),
-            "protocol": PROTOCOL, "batch_size": min(selected["microbatch"],
-                                                      bound["settings"]["evaluation_batch_cap"]),
+            "protocol": PROTOCOL, "batch_size": evaluation_microbatch(root, bound, item, selected),
             "precision": "bfloat16", "split": "validation", "n": VALIDATION_N}
 
 
