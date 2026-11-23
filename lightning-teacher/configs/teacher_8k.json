@@ -1,0 +1,20 @@
+{
+  "run_name": "t5_xl_xsum_8k_seed17",
+  "max_steps": 8000,
+  "seed": 17,
+  "data_seed": 104746,
+  "prefix": "summarize: ",
+  "max_source_tokens": 1024,
+  "max_target_tokens": 64,
+  "microbatch_size": 1,
+  "gradient_accumulation_steps": 32,
+  "learning_rate": 0.001,
+  "warmup_steps": 200,
+  "dropout": 0.1,
+  "gradient_checkpointing": true,
+  "save_every_steps": 100,
+  "keep_checkpoints": 2,
+  "eval_every_steps": 500,
+  "eval_examples": 128,
+  "gpu_memory_warning_gib": 75
+}

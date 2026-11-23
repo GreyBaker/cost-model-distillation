@@ -1,0 +1,168 @@
+from __future__ import annotations
+
+import csv
+import io
+import json
+import math
+from pathlib import Path
+
+from .policy import VALIDATION_N, cells, update_spec
+from .shared import atomic_json, read_json, sha256
+
+
+def select_pilot(results, candidates):
+    eligible = []
+    for size in candidates:
+        branches = [row for row in results if row["microbatch"] == size]
+        if len(branches) != 2 or {x["online"] for x in branches} != {False, True}:
+            raise ValueError("Incomplete/duplicate pilot branch coverage")
+        if all(row["status"] == "pass" for row in branches):
+            if any(not math.isfinite(x["mean_update_seconds"]) or x["mean_update_seconds"] <= 0
+                   for x in branches):
+                raise ValueError("Invalid pilot timing")
+            runtimes = [row["runtime"] for row in branches]
+            if runtimes[0] != runtimes[1]:
+                raise ValueError("Pilot hardware/software differs across branches")
+            eligible.append((math.sqrt(math.prod(x["mean_update_seconds"] for x in branches)), size, branches))
+    if not eligible:
+        raise ValueError("No common passing microbatch with reserved-memory headroom. Grid will not start.")
+    _, size, branches = min(eligible, key=lambda row: (row[0], row[1]))
+    return {"microbatch": size, "runtime": branches[0]["runtime"],
+            "off_policy": next(x for x in branches if not x["online"]),
+            "on_policy": next(x for x in branches if x["online"])}
+
+
+def estimate(root, selected, settings):
+    baseline_pointer = root / "baseline" / "latest_evaluation.json"
+    if not baseline_pointer.is_file():
+        raise ValueError("Finish the pilot's full baseline evaluation before estimating the grid")
+    from .evaluation import verify
+    output = Path(read_json(baseline_pointer)["path"])
+    baseline = verify(output, read_json(output / "COMPLETE.json")["identity"])
+    if baseline["n"] != VALIDATION_N or baseline["status"] != "complete":
+        raise ValueError("Full baseline evaluation missing")
+    mb = selected["microbatch"]
+    off = selected["off_policy"]["mean_update_seconds"] / (32 // mb)
+    on = selected["on_policy"]["mean_update_seconds"] / (32 // mb)
+    save_time = max(selected[key]["checkpoint_seconds"] for key in ("off_policy", "on_policy"))
+    # Pilot worker loads twice, scans longest rows, verifies hashes and saves.
+    # Half the residual is an intentionally rough per-cell startup allowance.
+    startup = max(0.0, max(
+        (selected[key]["wall_seconds"] - selected[key]["checkpoint_seconds"]
+         - sum(x["training_seconds"] for x in selected[key]["updates"])
+         - selected[key]["resumed_update"]["training_seconds"]) / 2
+        for key in ("off_policy", "on_policy")))
+    rows = []
+    for item in cells():
+        seconds = 0.0
+        for step in range(item["updates"]):
+            spec = update_spec(item, step)
+            seconds += math.ceil(spec["off"] / mb) * off + math.ceil(spec["on"] / mb) * on
+        saves = 1 + math.ceil(item["updates"] / settings["save_every_updates"])
+        rows.append({"cell": item["id"], "points": item["points"], "updates": item["updates"],
+                     "estimated_training_seconds": seconds,
+                     "estimated_checkpoint_seconds": saves * save_time,
+                     "estimated_initialization_seconds": startup,
+                     "estimated_evaluation_seconds": baseline["evaluation_seconds"],
+                     "estimated_total_seconds": seconds + saves * save_time + startup + baseline["wall_seconds"]})
+    return {"basis": "Measured joint-fit pilot on the actual GPU plus full common-baseline validation",
+            "pilot_sha256": sha256(root / "pilot.json"), "cells": rows,
+            "training_hours": sum(x["estimated_training_seconds"] for x in rows) / 3600,
+            "evaluation_hours": sum(x["estimated_evaluation_seconds"] for x in rows) / 3600,
+            "total_grid_hours": sum(x["estimated_total_seconds"] for x in rows) / 3600,
+            "baseline_already_spent_hours": baseline["wall_seconds"] / 3600,
+            "warning": "Projection, not a time/billing cap. Online pilot forces 64 tokens; actual generation lengths "
+                       "and mixed-batch overhead vary. Pilot costs, failures/replayed work and storage excluded. "
+                       "Full-grid forecast, not remaining-time forecast after a partial grid."}
+
+
+def records(path):
+    if not path.exists():
+        return []
+    result = []
+    with path.open(encoding="utf-8") as stream:
+        for line in stream:
+            try:
+                result.append(json.loads(line))
+            except json.JSONDecodeError:
+                # A killed process can leave only its final append incomplete.
+                if stream.read().strip():
+                    raise
+    return result
+
+
+def summary(root):
+    stages = records(root / "stages.jsonl")
+    baseline_metrics = {}
+    baseline_pointer = root / "baseline/latest_evaluation.json"
+    if baseline_pointer.exists():
+        baseline_metrics = read_json(Path(read_json(baseline_pointer)["path"]) / "metrics.json")
+    baseline = {"status": baseline_metrics.get("status", "pending"), "training_seconds": 0,
+                "training_time_scope": "No additional GKD; prior SFT preparation time is external.",
+                "evaluation_seconds": baseline_metrics.get("evaluation_seconds"),
+                "scores": baseline_metrics.get("scores", {})}
+    rows = []
+    for item in cells():
+        run_dir = root / "cells" / item["id"]
+        training_path = run_dir / "training_summary.json"
+        training = read_json(training_path) if training_path.exists() else {}
+        evaluation = {}
+        pointer = run_dir / "latest_evaluation.json"
+        if pointer.exists():
+            evaluation = read_json(Path(read_json(pointer)["path"]) / "metrics.json")
+        events = [event for path in sorted((run_dir / "sessions").glob("*.jsonl")) for event in records(path)]
+        own_stages = [x for x in stages if x["cell"] == item["id"]]
+        train_wall = sum(x["seconds"] for x in own_stages if x["operation"] == "train")
+        eval_wall = sum(x["seconds"] for x in own_stages if x["operation"] == "evaluate")
+        status = training.get("status", "pending")
+        if status == "complete":
+            status = "complete" if evaluation.get("status") == "complete" else "trained"
+        r2 = evaluation.get("scores", {}).get("rouge2")
+        baseline_r2 = baseline["scores"].get("rouge2")
+        row = {"cell": item["id"], "on_policy_percent": item["on_policy_percent"],
+               "budget_points": item["budget_points"], "planned_points": item["points"],
+               "unspent_points": item["unspent_points"], "status": status,
+               "points": training.get("points"), "on_policy_examples": training.get("on_policy_examples"),
+               "off_policy_examples": training.get("off_policy_examples"), "updates": training.get("step"),
+               "source_tokens": training.get("source_tokens"), "target_tokens": training.get("target_tokens"),
+               "training_seconds": training.get("training_seconds"),
+               "recorded_update_seconds_including_replay": sum(e.get("training_seconds", 0)
+                                                              for e in events if e["event"] == "update"),
+               "training_wall_seconds": train_wall,
+               "evaluation_seconds": evaluation.get("evaluation_seconds"),
+               "evaluation_wall_seconds": eval_wall,
+               "total_stage_wall_seconds": train_wall + eval_wall,
+               "rouge1": evaluation.get("scores", {}).get("rouge1"),
+               "rouge2": r2,
+               "rouge2_minus_sft": None if r2 is None or baseline_r2 is None else r2 - baseline_r2,
+               "rougeL": evaluation.get("scores", {}).get("rougeL")}
+        rows.append(row)
+    finished_logs = {x["log"] for x in stages}
+    unmeasured = [x for x in records(root / "stage_starts.jsonl") if x["log"] not in finished_logs]
+    result = {"rows": rows, "baseline": baseline,
+              "complete_cells": sum(x["status"] == "complete" for x in rows),
+              "unmeasured_interrupted_stages": unmeasured,
+              "shared_stage_wall_seconds": sum(x["seconds"] for x in stages if x["cell"] == "shared"),
+              "time_accounting": "training_seconds = committed synchronized update time including generation/scoring/backward. "
+                                 "Stage wall includes initialization/checkpoint/evaluation and recorded failed attempts. "
+                                 "Shared pilot/baseline/controller overhead is separate; killed controllers may leave unmeasured stages."}
+    atomic_json(root / "summary.json", result)
+    buffer = io.StringIO(newline="")
+    writer = csv.DictWriter(buffer, fieldnames=list(rows[0]))
+    writer.writeheader()
+    writer.writerows(rows)
+    (root / "summary.csv").write_text(buffer.getvalue(), encoding="utf-8")
+    def show(value, divisor=1):
+        return "—" if value is None else f"{value / divisor:.3f}"
+    lines = ["# Point-budget GKD results", "",
+             f"Common SFT baseline R2: **{show(baseline['scores'].get('rouge2'))}**; "
+             f"validation minutes: {show(baseline['evaluation_seconds'], 60)}. "
+             "Prior SFT training is not charged to GKD.", "",
+             "| Cell | Status | R2 | Training min | Eval min | Stage wall min |",
+             "| --- | --- | ---: | ---: | ---: | ---: |"]
+    lines.extend(f"| {row['cell']} | {row['status']} | {show(row['rouge2'])} | "
+                 f"{show(row['training_seconds'], 60)} | {show(row['evaluation_seconds'], 60)} | "
+                 f"{show(row['total_stage_wall_seconds'], 60)} |" for row in rows)
+    lines.extend(["", result["time_accounting"], ""])
+    (root / "SUMMARY.md").write_text("\n".join(lines), encoding="utf-8")
+    return result

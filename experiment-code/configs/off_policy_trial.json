@@ -1,0 +1,23 @@
+{
+  "run_name": "off_policy_reference_seed17",
+  "algorithm": "gkd",
+  "student_path": "assets/student",
+  "teacher_path": "assets/teacher",
+  "prepared_dir": "prepared/smoke",
+  "lmbda": 0.0,
+  "off_policy_source": "reference",
+  "beta": 0.5,
+  "seed": 17,
+  "max_steps": 8,
+  "schedule_horizon": 8,
+  "warmup_steps": 1,
+  "microbatch_size": 1,
+  "gradient_accumulation_steps": 4,
+  "max_source_tokens": 256,
+  "max_target_tokens": 32,
+  "precision": "bfloat16",
+  "device": "cuda:0",
+  "teacher_device": "cuda:0",
+  "gradient_checkpointing": true,
+  "save_every": 4
+}

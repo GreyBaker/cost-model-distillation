@@ -1,0 +1,38 @@
+{
+  "student": {
+    "repo_id": "google/t5-small-lm-adapt",
+    "revision": "4ff52753a4ddd906de166c573db99280719b22f9",
+    "files": [
+      {"path": "README.md", "bytes": 3211, "sha256": "81df68329ca75b8a1cde28423e72789bbe53a133f2bdcc48cf60f1c61e95255c"},
+      {"path": "config.json", "bytes": 652, "sha256": "205d7dad42e70811b20fd5a22fcca5e90dea28260a9faaa6fdbc930c76ce9d9b"},
+      {"path": "generation_config.json", "bytes": 147, "sha256": "f5a1c7e2be8092018d8835128987edf0111637dd98e90599cc80310fef75d95a"},
+      {"path": "pytorch_model.bin", "bytes": 307927045, "sha256": "caf2f8375bd2c4c9a7496805480e604c4c6a62ef71d6838b776d27bddc6e0535"},
+      {"path": "special_tokens_map.json", "bytes": 1786, "sha256": "4720c0fddbe4c5991334f85ad7073d9bd0a294a8ba4641a2f8dab614ca825949"},
+      {"path": "spiece.model", "bytes": 791656, "sha256": "d60acb128cf7b7f2536e8f38a5b18a05535c9e14c7a355904270e15b0945ea86"},
+      {"path": "tokenizer.json", "bytes": 1389370, "sha256": "0b1a5e2e0327534e124572fef5c726f364b9eee770a97bfe1fd022c405ea1da0"},
+      {"path": "tokenizer_config.json", "bytes": 2114, "sha256": "3ae2672228e7e0d49307c1311ec02970e2a5864cefa510cc8d3a2279e95ae3f7"}
+    ]
+  },
+  "teacher": {
+    "repo_id": "google/t5-xl-lm-adapt",
+    "revision": "f9843a55f0bdc37c957ddba20be0be4870b0a994",
+    "files": [
+      {"path": "README.md", "bytes": 3202, "sha256": "53704b51175ed3620531c570fed635a1d9a5733095190636fd0676746aca0bdb"},
+      {"path": "config.json", "bytes": 656, "sha256": "2493825151a00ba278b187fbb5e3e3e5bd548412f79e9bb5eb14b1c38085e3d9"},
+      {"path": "generation_config.json", "bytes": 147, "sha256": "f5a1c7e2be8092018d8835128987edf0111637dd98e90599cc80310fef75d95a"},
+      {"path": "pytorch_model.bin", "bytes": 11399278261, "sha256": "47f238cda51224325db106eb94e55d6a05b973eaa315f64ca8c82057a1b3227a"},
+      {"path": "special_tokens_map.json", "bytes": 1786, "sha256": "4720c0fddbe4c5991334f85ad7073d9bd0a294a8ba4641a2f8dab614ca825949"},
+      {"path": "spiece.model", "bytes": 791656, "sha256": "d60acb128cf7b7f2536e8f38a5b18a05535c9e14c7a355904270e15b0945ea86"},
+      {"path": "tokenizer.json", "bytes": 1389370, "sha256": "0b1a5e2e0327534e124572fef5c726f364b9eee770a97bfe1fd022c405ea1da0"},
+      {"path": "tokenizer_config.json", "bytes": 2114, "sha256": "3bd778c0d1049dde453592361f6dd620f4399e65f915240bffec4cae61f2f5f4"}
+    ]
+  },
+  "xsum": {
+    "repo_id": "EdinburghNLP/xsum",
+    "revision": "7d4d486c2f8ef850b1a11aead99b894ff3dd7da9",
+    "files": [
+      {"path": "data/train-00000-of-00001.parquet", "bytes": 299612457, "sha256": "0bba72d330f2a35ba20321444e54724e487b49f2eab6b26625b5f282d1c797c9"},
+      {"path": "data/validation-00000-of-00001.parquet", "bytes": 16447668, "sha256": "b7fc808c2dd3d1340349481aeef489e6eb8c22ff5739d8bce6d0f99e5ef8044d"}
+    ]
+  }
+}

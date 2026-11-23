@@ -1,0 +1,9 @@
+# Proposed cloud environment; cloud GPU validation is still required.
+# Install a CUDA PyTorch >=2.6,<3 wheel separately (setup.sh does this).
+transformers==4.57.6
+datasets==4.8.5
+accelerate==1.15.0
+sentencepiece>=0.2,<1
+safetensors>=0.5,<1
+rouge-score==0.1.2
+numpy>=1.26,<3

@@ -1,0 +1,29 @@
+{
+  "repo_id": "jordiclive/flan-t5-3b-summarizer",
+  "revision": "e1f3331b8e0de87602d944da709aa80ece72743f",
+  "model_path": "assets/jordiclive_flan_t5_3b_summarizer",
+  "prefix": "Given the following news article, summarize the article in one sentence: ",
+  "max_source_tokens": 512,
+  "max_target_tokens": 150,
+  "precision": "bfloat16",
+  "device": "cuda:0",
+  "batch_size": 1,
+  "seed": 17,
+  "split": "validation",
+  "decoding": "greedy, beam=1",
+  "rouge": "per-document F1 x100, macro mean, stemming; untruncated reference",
+  "profiles": {
+    "smoke": {
+      "prepared_dir": "prepared/smoke",
+      "limit": 16,
+      "expected_prepared_count": 64,
+      "output_dir": "runs/eval_jordiclive_smoke_16"
+    },
+    "validation": {
+      "prepared_dir": "prepared/xsum_full_validation",
+      "limit": null,
+      "expected_prepared_count": 11332,
+      "output_dir": "runs/eval_jordiclive_validation_11332"
+    }
+  }
+}

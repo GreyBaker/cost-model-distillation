@@ -1,0 +1,10 @@
+# Prototype compatibility bounds, NOT a tested environment lock.
+# Install the CUDA PyTorch wheel appropriate to the execution host first.
+torch>=2.6,<3
+transformers>=4.48,<5
+accelerate>=1.2,<2
+datasets>=3.2,<5
+sentencepiece>=0.2,<1
+safetensors>=0.5,<1
+rouge-score==0.1.2
+numpy>=1.26,<3

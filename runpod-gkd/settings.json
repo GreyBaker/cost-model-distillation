@@ -1,0 +1,12 @@
+{
+  "seed": 17,
+  "data_seed": 104746,
+  "effective_batch_size": 32,
+  "learning_rate": 0.001,
+  "save_every_updates": 50,
+  "pilot_microbatches": [1, 2, 4, 8, 16, 32],
+  "pilot_updates": 3,
+  "allocator_fraction": 0.9,
+  "pilot_reserved_fraction_limit": 0.85,
+  "evaluation_batch_cap": 16
+}
