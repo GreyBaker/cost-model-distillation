@@ -14,6 +14,7 @@ from gridlib.policy import ROOT
 from gridlib.shared import SFT_CODE, RunLock, atomic_json, read_json
 from gridlib.inputs import inspect_pair, separate_work
 from sftlib.core import configure_local_storage
+from sftlib.console import message, output
 
 
 class Stop:
@@ -92,10 +93,12 @@ def run(disk, accept_grid_estimate=False):
     with RunLock(state_dir / ".lock"), Stop() as stop:
         def status(phase, **extra):
             atomic_json(state_dir / "status.json", {"phase": phase, **extra})
-            print(json.dumps({"phase": phase, **extra}), flush=True)
+            details = " | ".join(f"{key.replace('_', ' ')}: {value}"
+                                 for key, value in extra.items() if key != "command")
+            message(f"Pipeline · {phase.replace('_', ' ')}" + (f" | {details}" if details else ""))
 
         try:
-            for name, argv in commands(sft_work, grid_work):
+            for index, (name, argv) in enumerate(commands(sft_work, grid_work), 1):
                 if stop.requested:
                     status("paused")
                     return
@@ -105,6 +108,7 @@ def run(disk, accept_grid_estimate=False):
                           "Existing SFT/pilot results will be reused.", flush=True)
                     return
                 status(name, command=argv)
+                message(f"Stage {index}/7")
                 started = time.monotonic()
                 try:
                     if not invoke(argv, stop):
@@ -138,6 +142,7 @@ def run(disk, accept_grid_estimate=False):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--pod-disk", type=Path, default=os.environ.get("POD_DISK"))
+    parser.add_argument("--json", action="store_true", help="Emit the read-only plan as JSON")
     subs = parser.add_subparsers(dest="command")
     subs.add_parser("plan", help="Read-only stage plan (default)")
     execute = subs.add_parser("run", help="ON POD: prepare/train SFT, then pilot/estimate/grid/audit")
@@ -147,11 +152,11 @@ def main():
                               "otherwise pause for review before grid training")
     args = parser.parse_args()
     if args.command != "run":
-        print(json.dumps({"operation": "plan only; no setup/downloads/ML/GPU work",
-                          "stages": [name for name, _ in commands("<SFT_WORK>", "<GKD_WORK>")],
-                          "prerequisites": "One disposable POD_DISK, both source folders and the SFT venv already set up.",
-                          "approval": "run requires recipe acceptance; without --accept-grid-estimate it pauses before the grid."},
-                         indent=2))
+        output({"operation": "plan only; no setup/downloads/ML/GPU work",
+                "stages": [name for name, _ in commands("<SFT_WORK>", "<GKD_WORK>")],
+                "prerequisites": "One disposable POD_DISK, both source folders and the SFT venv already set up.",
+                "approval": "run requires recipe acceptance; without --accept-grid-estimate it pauses before the grid."},
+               "SFT to GKD pipeline", args.json)
         return
     if args.pod_disk is None:
         parser.error("Set POD_DISK or pass --pod-disk before run")

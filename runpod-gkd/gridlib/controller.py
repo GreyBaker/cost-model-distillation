@@ -15,6 +15,7 @@ from .shared import atomic_json, checkpoints, read_json, sha256
 from .engine import append, check_state
 from .recovery import (CudaOOM, OOM_EXIT_CODE, evaluation_microbatch, evaluation_path,
                        lower, train_with_recovery)
+from sftlib.console import message, output as display, run_logged
 
 
 def command(root, sft_work, settings_path, operation, *extra):
@@ -37,22 +38,15 @@ class Runner:
         attempt = self.root / "attempts" / (uuid.uuid4().hex + ".json")
         append(self.root / "stage_starts.jsonl",
                {"cell": cell_id, "operation": operation, "log": str(log), "unix_time": time.time()})
-        print(json.dumps({"cell": cell_id, "operation": operation, "log": str(log)}), flush=True)
+        message(f"{cell_id} · {operation} | log: {log}")
         try:
-            with log.open("x", encoding="utf-8") as stream:
-                worker_extra = [*extra]
-                if operation in ("train", "evaluate"):
-                    worker_extra += ["--attempt-result", str(attempt)]
-                self.stop.child = subprocess.Popen(
-                    command(self.root, self.sft_work, self.settings_path, "_" + operation, *worker_extra),
-                    cwd=ROOT, stdout=stream, stderr=subprocess.STDOUT,
-                    start_new_session=os.name != "nt",
-                    env={**os.environ, "PYTHONUNBUFFERED": "1", "TOKENIZERS_PARALLELISM": "false"})
-                if self.stop.requested:
-                    import signal
-                    self.stop.child.send_signal(signal.SIGTERM)
-                code = self.stop.child.wait()
-                self.stop.child = None
+            worker_extra = [*extra]
+            if operation in ("train", "evaluate"):
+                worker_extra += ["--attempt-result", str(attempt)]
+            code = run_logged(
+                command(self.root, self.sft_work, self.settings_path, "_" + operation, *worker_extra),
+                log, self.stop, cwd=ROOT,
+                env={"PYTHONUNBUFFERED": "1", "TOKENIZERS_PARALLELISM": "false"})
             if code and not self.stop.requested:
                 if code == OOM_EXIT_CODE and attempt.is_file() and operation in ("train", "evaluate"):
                     report = read_json(attempt)
@@ -185,7 +179,7 @@ def pilot(root, bound, settings_path):
         atomic_json(root / "estimate.json", forecast)
         atomic_json(root / "status.json", {"status": "pilot_ready",
                                          "microbatch": selected["microbatch"]})
-        print(json.dumps(forecast, indent=2), flush=True)
+        display(forecast, "Grid runtime estimate")
 
 
 def run(root, bound, settings_path):
@@ -194,7 +188,7 @@ def run(root, bound, settings_path):
     # Full measured forecast is printed before ANY grid cell is started.
     forecast = reporting.estimate(root, selected, bound["settings"])
     atomic_json(root / "estimate.json", forecast)
-    print(json.dumps(forecast, indent=2), flush=True)
+    display(forecast, "Grid runtime estimate")
     with ChildStop() as stop:
         runner = Runner(root, bound["inputs"]["sft_work"], settings_path, stop)
         if not runner.call("runtime", "shared"):
@@ -203,9 +197,11 @@ def run(root, bound, settings_path):
             raise ValueError("GPU/software differs from the once-only pilot; use a new grid directory")
         if not ensure_evaluation(root, bound, None, selected, runner):
             return
-        for item in cells():
+        for index, item in enumerate(cells(), 1):
             if stop.requested:
                 break
+            message(f"Grid cell {index}/25 · {item['id']} · "
+                    f"{item['on_policy_percent']}% online · {item['points']:,} points")
             if not check_completed_training(root, bound, item, selected):
                 if not train_with_recovery(root, item, selected, runner):
                     break

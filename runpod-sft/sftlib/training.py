@@ -9,6 +9,7 @@ import uuid
 from . import assets, checkpoints, data, modeling
 from .core import Cursor, atomic_json, checkpoint_due, code_signature, environment, lr_for_update, read_json, sha256
 from .resume import config_compatible, record_migration, signatures_compatible
+from .console import duration, message, progress
 
 
 def seed(value):
@@ -127,6 +128,7 @@ def train(work, value, resume=None, session_updates=None):
                 "execution_config": value, "execution_signatures": signatures})
     atomic_json(run_dir / "status.json", {"status": "initializing", "session_id": session_id})
     seed(value["seed"])
+    message(f"Loading {value['role']} SFT model" + (" and restart state..." if checkpoint else "..."))
     tokenizer, model = modeling.load(checkpoint or work / "assets/model", device, True, value)
     optimizer = Adafactor(model.parameters(), lr=value["learning_rate"], eps=(1e-30, 1e-3),
                          clip_threshold=1.0, decay_rate=-0.8, beta1=None, weight_decay=0.0,
@@ -150,13 +152,30 @@ def train(work, value, resume=None, session_updates=None):
         del state
     start_step, last_saved = step, step if checkpoint else -1
     torch.cuda.reset_peak_memory_stats(device)
+    bar = progress(value["max_steps"], initial=step, desc=f"{value['role'].title()} SFT", unit="update")
 
     def log(record):
         record["wall_time_unix"] = time.time()
         with log_path.open("a", encoding="utf-8") as stream:
             stream.write(json.dumps(record, allow_nan=False) + "\n")
             stream.flush()
-        print(json.dumps(record), flush=True)
+        if record["event"] == "update":
+            bar.set_postfix(loss=f"{record['loss']:.4f}", lr=f"{record['learning_rate']:.2g}",
+                            VRAM=f"{record['peak_allocated_bytes'] / 1024**3:.1f}GiB",
+                            mb=value["microbatch_size"], refresh=False)
+            bar.update(1)
+        elif record["event"] == "checkpoint":
+            message(f"{value['role'].title()} checkpoint saved at update {record['step']:,} "
+                    f"({duration(record['seconds'])}).")
+        elif record["event"] == "validation":
+            message(f"{value['role'].title()} validation at update {record['step']:,}: "
+                    f"CE {record['validation_loss']:.4f} ({duration(record['seconds'])}).")
+        elif record["event"] == "initialized":
+            message(f"{value['role'].title()} SFT ready at update {step:,}; "
+                    f"microbatch {value['microbatch_size']} × accumulation "
+                    f"{value['gradient_accumulation_steps']} (loaded in {duration(record['seconds'])}).")
+        elif record["event"] == "session_end":
+            message(f"{value['role'].title()} SFT session ended at {step:,}/{value['max_steps']:,} updates.")
 
     def status(state):
         atomic_json(run_dir / "status.json", {"status": state, "role": value["role"], "step": step,
@@ -233,3 +252,5 @@ def train(work, value, resume=None, session_updates=None):
                     "last_completed_step": step, "session_id": session_id, "error": str(error),
                     "recovery": "Resume latest COMPLETE checkpoint only; inspect incomplete saves"})
         raise
+    finally:
+        bar.close()

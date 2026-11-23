@@ -13,6 +13,7 @@ import uuid
 from . import assets, checkpoints, data, inference
 from .core import ROOT, SPEC, RunLock, atomic_json, code_signature, config, read_json, sha256
 from .resume import config_compatible, record_migration
+from .console import message, run_logged
 
 ORDER = ("student", "teacher")
 
@@ -84,7 +85,8 @@ def run(root, config_dir):
 
         def status(phase, **extra):
             atomic_json(root / "status.json", {"phase": phase, "wall_time_unix": time.time(), **extra})
-            print(json.dumps({"phase": phase, **extra}), flush=True)
+            details = " | ".join(f"{key.replace('_', ' ')}: {value}" for key, value in extra.items())
+            message(f"SFT · {phase.replace('_', ' ')}" + (f" | {details}" if details else ""))
 
         with ChildStop() as stop:
             def child(role, operation, *extra):
@@ -92,15 +94,8 @@ def run(root, config_dir):
                     return False
                 log = logs / f"{role}-{operation}-{time.time_ns()}.log"
                 status(f"{role}_{operation}", log=str(log))
-                with log.open("x", encoding="utf-8") as stream:
-                    stop.child = subprocess.Popen(command(root, config_dir, role, operation, *extra),
-                                                  cwd=ROOT, stdout=stream, stderr=subprocess.STDOUT,
-                                                  start_new_session=os.name != "nt",
-                                                  env={**os.environ, "PYTHONUNBUFFERED": "1", "TOKENIZERS_PARALLELISM": "false"})
-                    if stop.requested:
-                        stop.child.send_signal(signal.SIGTERM)
-                    code = stop.child.wait()
-                    stop.child = None
+                code = run_logged(command(root, config_dir, role, operation, *extra), log, stop,
+                                  cwd=ROOT, env={"PYTHONUNBUFFERED": "1", "TOKENIZERS_PARALLELISM": "false"})
                 if code and not stop.requested:
                     raise RuntimeError(f"{role} {operation} failed; inspect {log}")
                 return not stop.requested

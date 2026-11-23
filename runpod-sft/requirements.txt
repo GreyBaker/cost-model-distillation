@@ -6,3 +6,4 @@ sentencepiece==0.2.1
 safetensors==0.8.0
 rouge-score==0.1.2
 numpy>=1.26,<3
+tqdm>=4.67,<5

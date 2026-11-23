@@ -8,6 +8,7 @@ from pathlib import Path
 
 from gridlib import policy
 from gridlib.shared import RunLock, atomic_json, read_json
+from sftlib.console import output as display
 
 
 def main():
@@ -15,6 +16,7 @@ def main():
     parser.add_argument("--work-dir", type=Path, default=Path(os.environ.get("GKD_WORK", "work")))
     parser.add_argument("--sft-work", type=Path, default=Path(os.environ.get("SFT_WORK", "../runpod-sft/work")))
     parser.add_argument("--settings", type=Path, default=policy.ROOT / "settings.json")
+    parser.add_argument("--json", action="store_true", help="JSON for plan/summary/estimate/audit reports")
     commands = parser.add_subparsers(dest="command")
     commands.add_parser("plan", help="Read-only grid/count/runtime scenarios; no ML imports")
     commands.add_parser("bind", help="After SFT only: verify/freeze completed pair (hashes; no GPU/model load)")
@@ -36,7 +38,7 @@ def main():
     operation = args.command or "plan"
     settings = policy.settings(args.settings)
     if operation == "plan":
-        print(json.dumps({**policy.plan(), "settings": settings}, indent=2))
+        display({**policy.plan(), "settings": settings}, "Point-budget GKD plan", args.json)
         return
     root, sft_work = args.work_dir.resolve(), args.sft_work.resolve()
     if operation == "summary":
@@ -44,7 +46,7 @@ def main():
         if not root.is_dir():
             raise ValueError("No existing grid work directory")
         with RunLock(root / ".controller.lock"):
-            print(json.dumps(summary(root), indent=2))
+            display(summary(root), "Grid results", args.json)
         return
     from gridlib.inputs import binding, separate_work
     separate_work(root, sft_work)
@@ -53,7 +55,7 @@ def main():
         from gridlib.reporting import estimate
         # Read only: no locks/directories/files are created and no CUDA is touched.
         bound = binding(root, sft_work, settings, full=False)
-        print(json.dumps(estimate(root, saved_pilot(root), settings), indent=2))
+        display(estimate(root, saved_pilot(root), settings), "Grid runtime estimate", args.json)
         return
     lock_name = ".worker.lock" if operation.startswith("_") else ".controller.lock"
     if operation in ("pilot", "run", "_runtime", "_pilot", "_train", "_evaluate"):
@@ -67,7 +69,7 @@ def main():
             from gridlib.audit import audit
             result = audit(root, bound)
             atomic_json(root / "audit.json", result)
-            print(json.dumps(result, indent=2))
+            display(result, "Grid integrity audit", args.json)
         elif operation == "pilot":
             from gridlib.controller import pilot
             try:

@@ -7,6 +7,7 @@ import urllib.request
 import uuid
 
 from .core import SPEC, asset_spec, atomic_json, check_space, read_json, sha256
+from .console import progress
 
 
 def valid(path, entry):
@@ -43,10 +44,12 @@ def transfer(url, destination, entry, local_source=None):
                             offset = 0
                         else:
                             raise ValueError(f"Unexpected HTTP status: {response.status}")
-                        print(f"Downloading {destination.name}: {offset:,}/{entry['bytes']:,}", flush=True)
-                        with partial.open("ab" if offset else "wb") as stream:
+                        with partial.open("ab" if offset else "wb") as stream, \
+                                progress(entry["bytes"], initial=offset, desc=f"Download {destination.name}",
+                                         unit="B") as bar:
                             while chunk := response.read(4 * 1024**2):
                                 stream.write(chunk)
+                                bar.update(len(chunk))
                 break
             except OSError:
                 if attempt == 2:

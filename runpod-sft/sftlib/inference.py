@@ -10,6 +10,7 @@ from . import checkpoints, data, modeling
 from .core import (STEPS, atomic_json, check_space, code_signature, environment, read_json, sha256,
                    sync_directory, sync_tree, tree_manifest, verify_tree)
 from .resume import config_compatible
+from .console import output as display, progress
 
 
 def export_path(work, value, step=None):
@@ -132,7 +133,7 @@ def evaluate(work, value, output, limit=0):
     count = limit or data.COUNTS["validation"]
     if output.exists():
         metrics = verify_evaluation(work, value, output, export_dir, count)
-        print(json.dumps(metrics, indent=2), flush=True)
+        display(metrics, f"Reused {value['role']} validation")
         return metrics
     dataset = data.load(work)["validation"]
     device = modeling.cuda_device(value, for_training=False)
@@ -146,7 +147,8 @@ def evaluate(work, value, output, limit=0):
     sums = {name: 0.0 for name in ("rouge1", "rouge2", "rougeL")}
     counters = {name: 0 for name in ("source_truncated", "reference_over_cap", "hit_generation_cap", "empty_prediction")}
     started = time.monotonic()
-    with (output / "predictions.jsonl").open("x", encoding="utf-8") as stream:
+    with (output / "predictions.jsonl").open("x", encoding="utf-8") as stream, \
+            progress(count, desc=f"{value['role'].title()} validation", unit="summary") as bar:
         for start in range(0, count, value["evaluation_batch_size"]):
             rows = [dataset[index] for index in range(start, min(count, start + value["evaluation_batch_size"]))]
             inputs, _ = data.batch(tokenizer, rows, device)
@@ -167,11 +169,12 @@ def evaluate(work, value, output, limit=0):
                              "prediction": text, "target_tokens_including_eos": len(ids), "terminated_with_eos": eos,
                              "scores": scores, **flags}, ensure_ascii=False) + "\n")
             stream.flush()
-            print(f"Evaluated {min(start + len(rows), count)}/{count}", flush=True)
+            bar.set_postfix(R2=f"{sums['rouge2'] / (start + len(rows)):.2f}", refresh=False)
+            bar.update(len(rows))
     torch.cuda.synchronize(device)
     metrics = {"status": "complete", "role": value["role"], "split": "validation", "n": count,
                "scores": {name: result / count for name, result in sums.items()}, "counts": counters,
                "seconds": time.monotonic() - started, "predictions_sha256": sha256(output / "predictions.jsonl")}
     atomic_json(output / "metrics.json", metrics)
-    print(json.dumps(metrics, indent=2), flush=True)
+    display(metrics, f"{value['role'].title()} validation complete")
     return metrics

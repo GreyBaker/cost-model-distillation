@@ -10,6 +10,7 @@ import uuid
 
 from .policy import PROTOCOL, TRAIN_N, chunks, lr_factor, update_spec
 from .shared import Cursor, atomic_json, checkpoints, read_json, sha256
+from sftlib.console import duration, message, progress
 
 
 def append(path, record):
@@ -63,6 +64,8 @@ def train(root, bound, item, selected, session_updates=None, microbatch=None):
     else:
         if run_dir.exists():
             raise FileExistsError(f"Inspect nonempty/unowned cell directory: {run_dir}")
+    message(f"Loading {item['id']} · microbatch {microbatch}"
+            + (" · resuming latest checkpoint..." if checkpoint else " · fresh common SFT initialization..."))
     device, runtime, tokenizer, student, teacher, datasets = backend.load_pair(
         bound, settings, checkpoint)
     if runtime != selected["runtime"]:
@@ -104,6 +107,7 @@ def train(root, bound, item, selected, session_updates=None, microbatch=None):
                      "microbatch": microbatch, "effective_batch_size": 32})
     last_saved = state["step"] if checkpoint else -1
     start_step = state["step"]
+    bar = progress(item["points"], initial=state["points"], desc=f"GKD {item['id']}", unit="pt")
 
     def save(reason):
         nonlocal last_saved
@@ -118,6 +122,8 @@ def train(root, bound, item, selected, session_updates=None, microbatch=None):
         last_saved = state["step"]
         append(session, {"event": "checkpoint", "step": last_saved,
                          "seconds": time.monotonic() - before})
+        message(f"{item['id']} checkpoint saved: update {last_saved:,}, "
+                f"{state['points']:,}/{item['points']:,} points.")
         atomic_json(run_dir / "training_summary.json",
                     {"status": "paused", "cell": item, **state,
                      "checkpoint": str(checkpoints.resolve(run_dir)),
@@ -155,8 +161,11 @@ def train(root, bound, item, selected, session_updates=None, microbatch=None):
                 append(session, {"event": "update", "step": state["step"], "points": state["points"],
                                  "on": spec["on"], "off": spec["off"], "learning_rate": rate,
                                  "microbatch": microbatch, "microbatches": len(batches), **result})
-                print(json.dumps({"cell": item["id"], "step": state["step"], "points": state["points"],
-                                  "training_seconds": state["training_seconds"], "loss": result["loss"]}), flush=True)
+                bar.set_postfix(loss=f"{result['loss']:.4f}", lr=f"{rate:.2g}",
+                                update=f"{state['step']}/{item['updates']}", mb=microbatch,
+                                VRAM=f"{result.get('peak_allocated_bytes', 0) / 1024**3:.1f}GiB",
+                                train=duration(state["training_seconds"]), refresh=False)
+                bar.update(spec["points"])
                 stopping = stop.requested or (session_updates is not None
                                               and state["step"] - start_step >= session_updates)
                 if stopping or state["step"] == item["updates"] or state["step"] % settings["save_every_updates"] == 0:
@@ -175,6 +184,7 @@ def train(root, bound, item, selected, session_updates=None, microbatch=None):
                     "recovery": "Resume only this cell's latest COMPLETE checkpoint; preserve incomplete files."})
         raise
     finally:
+        bar.close()
         append(session, {"event": "session_end", "seconds": time.monotonic() - started})
 
 
@@ -198,14 +208,22 @@ def pilot_worker(root, bound, microbatch, online, output):
         batches = [(online, rows[i:i + microbatch]) for i in range(0, 32, microbatch)]
         opt = backend.optimizer(student, settings["learning_rate"])
         torch.cuda.reset_peak_memory_stats(device)
-        records = [backend.update(student, teacher, tokenizer, opt, batches, 32, device, force_cap=True)
-                   for _ in range(settings["pilot_updates"])]
+        records = []
+        with progress(settings["pilot_updates"], desc=f"Pilot mb={microbatch} {'online' if online else 'offline'}",
+                      unit="update") as bar:
+            for _ in range(settings["pilot_updates"]):
+                record = backend.update(student, teacher, tokenizer, opt, batches, 32, device, force_cap=True)
+                records.append(record)
+                bar.set_postfix(loss=f"{record['loss']:.4f}",
+                                VRAM=f"{record['peak_reserved_bytes'] / 1024**3:.1f}GiB", refresh=False)
+                bar.update()
         # Checkpoint save and real reload/update are part of fit, not just forward/backward.
         pilot_run = output.parent / (output.stem + "-restart")
         pilot_run.mkdir(parents=True)
         run = {"run_id": uuid.uuid4().hex, "config": {"microbatch": microbatch, "online": online},
                "signatures": {"binding": sha256(root / "binding.json")}}
         atomic_json(pilot_run / "run.json", run)
+        message(f"Pilot mb={microbatch} {'online' if online else 'offline'}: checking checkpoint save/reload...")
         before = time.monotonic()
         checkpoint = checkpoints.save(pilot_run, student, tokenizer,
                                      {"step": settings["pilot_updates"], "optimizer": opt.state_dict(),
@@ -238,3 +256,5 @@ def pilot_worker(root, bound, microbatch, online, output):
                   "error": str(error), "wall_seconds": time.monotonic() - started}
     result["binding_sha256"] = sha256(root / "binding.json")
     atomic_json(output, result)
+    message(f"Pilot mb={microbatch} {'online' if online else 'offline'}: {result['status'].upper()}"
+            + (f", {result['mean_update_seconds']:.2f}s/update" if "mean_update_seconds" in result else ""))

@@ -8,6 +8,7 @@ import time
 from .policy import PROTOCOL, VALIDATION_N
 from .shared import (atomic_json, checkpoints, read_json, sha256, tree_manifest,
                      verify_tree)
+from sftlib.console import output as display, progress
 
 
 def verify(output, identity):
@@ -75,7 +76,9 @@ def evaluate(root, bound, item, selected, output):
                                     "hit_generation_cap", "empty_prediction")}
     torch.cuda.synchronize(device)
     generation_started = time.monotonic()
-    with (output / "predictions.jsonl").open("x", encoding="utf-8") as stream:
+    with (output / "predictions.jsonl").open("x", encoding="utf-8") as stream, \
+            progress(VALIDATION_N, desc=f"{item['id'] if item else 'SFT baseline'} validation",
+                     unit="summary") as bar:
         for start in range(0, VALIDATION_N, expected["batch_size"]):
             rows = [dataset[i] for i in range(start, min(VALIDATION_N, start + expected["batch_size"]))]
             inputs, _ = data.batch(tokenizer, rows, device)
@@ -100,8 +103,8 @@ def evaluate(root, bound, item, selected, output):
                              "reference": row["reference"], "prediction": text, "generated_ids": tokens,
                              "terminated_with_eos": eos, "scores": scores, **flags}, ensure_ascii=False) + "\n")
             stream.flush()
-            print(f"{item['id'] if item else 'baseline'} validation {min(start + len(rows), VALIDATION_N)}/{VALIDATION_N}",
-                  flush=True)
+            bar.set_postfix(R2=f"{sums['rouge2'] / (start + len(rows)):.2f}", refresh=False)
+            bar.update(len(rows))
     torch.cuda.synchronize(device)
     metrics = {"status": "complete", "split": "validation", "n": VALIDATION_N,
                "scores": {name: score / VALIDATION_N for name, score in sums.items()},
@@ -111,4 +114,6 @@ def evaluate(root, bound, item, selected, output):
     atomic_json(output / "metrics.json", metrics)
     atomic_json(output / "COMPLETE.json", {"identity": expected, "n": VALIDATION_N,
                                          "files": tree_manifest(output)})
+    display({"scores": metrics["scores"], "evaluation_seconds": metrics["evaluation_seconds"]},
+            f"{item['id'] if item else 'SFT baseline'} validation complete")
     return metrics

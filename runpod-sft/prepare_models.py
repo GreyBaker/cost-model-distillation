@@ -8,6 +8,7 @@ from pathlib import Path
 
 from sftlib.core import (CONFIGS, SPEC, RunLock, asset_spec, atomic_json, config,
                          configure_local_storage, read_json)
+from sftlib.console import output as display
 
 
 def plan(root, config_dir):
@@ -33,6 +34,7 @@ def main():
     parser.add_argument("--work-dir", type=Path, default=Path(os.environ.get("SFT_WORK", "work")),
                         help="Directory on the short-lived on-Pod disk; source pod_env.sh to set SFT_WORK")
     parser.add_argument("--config-dir", type=Path, default=CONFIGS)
+    parser.add_argument("--json", action="store_true", help="JSON for reports instead of readable text")
     commands = parser.add_subparsers(dest="command")
     commands.add_parser("plan", help="Read-only plan (default)")
     prepare = commands.add_parser("prepare", help="Explicit pinned downloads and local train/validation tokenization")
@@ -65,7 +67,7 @@ def main():
     root, config_dir = args.work_dir.expanduser().resolve(), args.config_dir.expanduser().resolve()
     operation = args.command or "plan"
     if operation == "plan":
-        print(json.dumps(plan(root, config_dir), indent=2))
+        display(plan(root, config_dir), "Paired SFT plan", args.json)
         return
     if operation == "status":
         from sftlib.checkpoints import completed
@@ -76,17 +78,18 @@ def main():
             result[role] = {"status": read_json(run_dir / "status.json") if (run_dir / "status.json").exists() else None,
                             "checkpoints": [str(path) for path in completed(run_dir)]}
         result["sequence"] = read_json(root / "status.json") if (root / "status.json").exists() else None
-        print(json.dumps(result, indent=2))
+        display(result, "SFT status", args.json)
         return
     if operation == "verify-export":
         from sftlib.inference import verify_export
         marker = verify_export(args.directory.resolve())
-        print(json.dumps({"status": "verified", "role": marker["role"], "step": marker["step"]}, indent=2))
+        display({"status": "verified", "role": marker["role"], "step": marker["step"]},
+               "Export integrity", args.json)
         return
     if operation == "estimate":
         from sftlib.estimates import report
         value = config(args.role, config_dir)
-        print(json.dumps(report(root / args.role, value, args.hourly_rate), indent=2))
+        display(report(root / args.role, value, args.hourly_rate), "SFT runtime estimate", args.json)
         return
     if operation == "run":
         if not args.accept_reconstructed_recipe:
@@ -134,8 +137,8 @@ def main():
             import torch
             device = modeling.cuda_device(value)
             free, total = torch.cuda.mem_get_info(device)
-            print(json.dumps({"role": args.role, "environment": environment(), "gpu": torch.cuda.get_device_name(device),
-                              "free_gib": free / 1024**3, "total_gib": total / 1024**3}, indent=2))
+            display({"role": args.role, "environment": environment(), "gpu": torch.cuda.get_device_name(device),
+                    "free_gib": free / 1024**3, "total_gib": total / 1024**3}, "GPU preflight", args.json)
         elif operation == "train":
             if not args.resume and not args.accept_reconstructed_recipe:
                 raise ValueError("Read DECISIONS.md, then pass --accept-reconstructed-recipe")
