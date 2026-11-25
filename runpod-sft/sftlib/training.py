@@ -6,8 +6,9 @@ import signal
 import time
 import uuid
 
-from . import assets, checkpoints, data, modeling
-from .core import Cursor, atomic_json, checkpoint_due, code_signature, environment, lr_for_update, read_json, sha256
+from . import assets, checkpoints, data, modeling, monitoring
+from .core import (Cursor, atomic_json, checkpoint_due, code_signature, environment,
+                   lr_for_update, read_json, recipe_evidence, sha256)
 from .resume import config_compatible, record_migration, signatures_compatible
 from .console import duration, message, progress
 
@@ -97,7 +98,7 @@ def optimizer(model, value):
     from transformers import Adafactor
     return Adafactor(model.parameters(), lr=value["learning_rate"], eps=(1e-30, 1e-3),
                      clip_threshold=1.0, decay_rate=-0.8, beta1=None, weight_decay=0.0,
-                     scale_parameter=False, relative_step=False, warmup_init=False)
+                     scale_parameter=value.get("scale_parameter", False), relative_step=False, warmup_init=False)
 
 
 def update(model, tokenizer, opt, rows, value, device):
@@ -109,7 +110,7 @@ def update(model, tokenizer, opt, rows, value, device):
     opt.zero_grad(set_to_none=True)
     torch.cuda.synchronize(device)
     before = time.monotonic()
-    denominator = data.target_count(rows)
+    denominator = value.get("loss_normalizing_factor", data.target_count(rows))
     total_loss, source_tokens, target_tokens = 0.0, 0, 0
     for offset in range(0, count, value["microbatch_size"]):
         batch = rows[offset:offset + value["microbatch_size"]]
@@ -117,7 +118,10 @@ def update(model, tokenizer, opt, rows, value, device):
         source_tokens += int(inputs["attention_mask"].sum().item())
         target_tokens += data.target_count(batch)
         with torch.autocast("cuda", dtype=torch.bfloat16):
-            loss = modeling.loss_sum(model, inputs, labels) / denominator
+            if value.get("z_loss", 0):
+                loss = modeling.loss_sum(model, inputs, labels, z_loss=value["z_loss"]) / denominator
+            else:
+                loss = modeling.loss_sum(model, inputs, labels) / denominator
         if not torch.isfinite(loss):
             raise FloatingPointError("Nonfinite SFT loss; no precision fallback")
         total_loss += float(loss.detach().item())
@@ -128,6 +132,7 @@ def update(model, tokenizer, opt, rows, value, device):
     opt.zero_grad(set_to_none=True)
     torch.cuda.synchronize(device)
     return {"loss": total_loss, "gradient_norm": float(norm),
+            "loss_normalizer": denominator, "z_loss_coefficient": value.get("z_loss", 0.0),
             "source_tokens": source_tokens, "target_tokens": target_tokens,
             "update_seconds": time.monotonic() - before,
             "peak_allocated_bytes": torch.cuda.max_memory_allocated(device),
@@ -156,7 +161,7 @@ def train(work, value, resume=None, session_updates=None):
         record_migration(run_dir / "migrations",
                          {"config": run["config"], "signatures": run["signatures"]},
                          {"config": value, "signatures": signatures}, checkpoint)
-        if marker["step"] >= value["max_steps"]:
+        if marker["step"] >= value["max_steps"] and monitoring.finished(run_dir, value, marker["step"]):
             print("This role already completed its full update budget; no training run.")
             return
     else:
@@ -164,6 +169,8 @@ def train(work, value, resume=None, session_updates=None):
             raise FileExistsError(f"Run exists; use --resume latest: {run_dir}")
         run_dir.mkdir(parents=True)
         run = {"run_id": uuid.uuid4().hex, "config": value, "signatures": signatures, "runtime": runtime_info}
+        if value["role"] == "teacher":
+            run["recipe_evidence"] = recipe_evidence(value)
         atomic_json(run_dir / "run.json", run)
     session_id = uuid.uuid4().hex
     log_dir = run_dir / "sessions"
@@ -213,7 +220,13 @@ def train(work, value, resume=None, session_updates=None):
                     f"({duration(record['seconds'])}).")
         elif record["event"] == "validation":
             message(f"{value['role'].title()} validation at update {record['step']:,}: "
-                    f"CE {record['validation_loss']:.4f} ({duration(record['seconds'])}).")
+                     f"CE {record['validation_loss']:.4f} ({duration(record['seconds'])}).")
+        elif record["event"] == "greedy_monitor":
+            message(f"Teacher greedy monitor at update {record['step']:,}: "
+                    f"R2 {record['scores']['rouge2']:.3f}, n={record['n']} "
+                    f"({duration(record['seconds'])}).")
+            if record["step"] == value.get("review_step"):
+                message(f"Teacher 1K advisory review saved: {run_dir / 'teacher_review.json'}")
         elif record["event"] == "initialized":
             message(f"{value['role'].title()} SFT ready at update {step:,}; "
                     f"microbatch {value['microbatch_size']} × accumulation "
@@ -236,6 +249,20 @@ def train(work, value, resume=None, session_updates=None):
             last_saved = step
             log({"event": "checkpoint", "step": step, "seconds": time.monotonic() - before, "reason": reason})
 
+    def monitor():
+        if not monitoring.due(value, step):
+            return
+        saved_rng = rng_state()
+        try:
+            result = monitoring.record(run_dir, value, step, lambda: monitoring.measure(
+                model, tokenizer, datasets["validation"], value, device))
+        finally:
+            # Evaluation must not consume training RNG even if implementation
+            # changes later, or if a monitoring OOM aborts this worker.
+            restore_rng(saved_rng)
+        log({"event": "greedy_monitor", "step": step, "scores": result["scores"],
+             "counts": result["counts"], "n": result["n"], "seconds": result["seconds"]})
+
     try:
         with StopRequest() as stop:
             log({"event": "initialized", "step": step, "seconds": time.monotonic() - started})
@@ -246,6 +273,8 @@ def train(work, value, resume=None, session_updates=None):
                 before = time.monotonic()
                 result = validation_loss(model, tokenizer, datasets["validation"], value, device)
                 log({"event": "validation", "step": 0, "seconds": time.monotonic() - before, **result})
+            if not stop.requested:
+                monitor()  # Also repairs interrupted diagnostics at a resumed boundary.
             while step < value["max_steps"] and not stop.requested:
                 learning_rate = lr_for_update(value, step)
                 for group in opt.param_groups:
@@ -271,6 +300,8 @@ def train(work, value, resume=None, session_updates=None):
                     before = time.monotonic()
                     result = validation_loss(model, tokenizer, datasets["validation"], value, device)
                     log({"event": "validation", "step": step, "seconds": time.monotonic() - before, **result})
+                if not stop.requested:
+                    monitor()
                 if stopping:
                     break
             save("session end")

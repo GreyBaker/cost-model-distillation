@@ -6,8 +6,8 @@ import json
 import os
 from pathlib import Path
 
-from sftlib.core import (CONFIGS, SPEC, RunLock, asset_spec, atomic_json, config,
-                         configure_local_storage, read_json)
+from sftlib.core import (CONFIGS, SPEC, RunLock, asset_spec, atomic_json, check_teacher_work, config,
+                          configure_local_storage, read_json, recipe_evidence)
 from sftlib.console import output as display
 
 
@@ -20,19 +20,26 @@ def plan(root, config_dir):
         batch = value["microbatch_size"] * value["gradient_accumulation_steps"]
         roles[role] = {"config": value, "base": {name: spec["model"][name] for name in ("repo_id", "revision")},
                         "work": str(root / role), "effective_batch": batch,
+                        "recipe_evidence": recipe_evidence(value),
                         "example_presentations": value["max_steps"] * batch,
                         "sft_microbatch_pilot": {
                             "partitions_largest_first": [f"{size}x{batch // size}" for size in candidates(value)],
                             "discarded_updates_per_candidate": PILOT_UPDATES,
                             "reload_updates": 1, "reserved_fraction_limit": RESERVED_FRACTION_LIMIT,
                             "selection": "largest passing full-shape train/save/reload microbatch; once per role"},
+                        "greedy_monitoring": ({"every_steps": value["rouge_every_steps"],
+                            "examples": value["rouge_examples"], "advisory_review_step": value["review_step"],
+                            "retention": "latest two + pinned subset-best; final 8K exported for grid"}
+                            if role == "teacher" else None),
                        "download_bytes": sum(item["bytes"] for group in spec.values() for item in group["files"])}
     return {"operation": "plan only; no ML imports, downloads, CUDA calls or training", "order": ["student", "teacher"],
             "roles": roles, "automatic_time_limit": None, "export": "separate BF16 safetensors with serialization parity probes",
             "hardware": "one native-BF16 CUDA GPU; planned 80 GB-class A100/H100; no name restriction",
             "storage": "One disposable on-Pod disk for source, venv, caches, temp, data and outputs; "
                        "target 150 GB available for SFT plus the later grid; no separate disk or persistence assumed",
-            "evidence_boundary": "Appendix A.2 fixes student 100K / teacher 8K added SFT updates. Batch/LR/schedule/dropout/normalization remain an explicit reconstruction."}
+             "evidence_boundary": "Student recipe unchanged. Teacher adapts public T5X XL/XSum: batch128, "
+                                  "8K updates, parameter-scaled Adafactor 5e-4, warmup800, cooldown6K-8K, "
+                                  "z-loss1e-4 and fixed divisor233472 at 1024/64. Not exact GKD-author SFT."}
 
 
 def main():
@@ -162,6 +169,7 @@ def main():
             from sftlib import assets
             value = config(args.role, config_dir)
             work = root / args.role
+            check_teacher_work(work, value)
             assets.acquire(work, value, args.from_assets.resolve() if args.from_assets else None)
             if not args.assets_only:
                 from sftlib.data import prepare

@@ -6,7 +6,7 @@ import re
 import shutil
 import uuid
 
-from .core import atomic_json, check_space, read_json, sync_directory, sync_tree, tree_manifest, verify_tree
+from .core import atomic_json, check_space, read_json, sha256, sync_directory, sync_tree, tree_manifest, verify_tree
 
 PATTERN = re.compile(r"step-\d{8}")
 
@@ -46,9 +46,38 @@ def verify(path, run_id):
     return marker
 
 
+def best_checkpoint(run_dir):
+    """Validate the pinned pointer and its immutable monitoring evidence."""
+    choices = completed(run_dir)
+    best_path = run_dir / "best_checkpoint.json"
+    if not best_path.exists():
+        return None
+    best = read_json(best_path)
+    run = read_json(run_dir / "run.json")
+    if (best.get("run_id") != run["run_id"] or type(best.get("step")) is not int
+            or best.get("path") != f"step-{best['step']:08d}"
+            or best.get("monitoring") != f"monitoring/step-{best['step']:08d}.json"):
+        raise ValueError("Foreign/unsafe best checkpoint pointer")
+    pinned = run_dir / "checkpoints" / best["path"]
+    if pinned not in choices or sha256(pinned / "COMPLETE.json") != best["complete_sha256"]:
+        raise ValueError("Pinned best checkpoint is missing or changed")
+    evidence = run_dir / best["monitoring"]
+    if sha256(evidence) != best["monitoring_sha256"]:
+        raise ValueError("Pinned best monitoring evidence changed")
+    result = read_json(evidence)
+    if (result.get("run_id") != run["run_id"] or result.get("step") != best["step"]
+            or result.get("source_checkpoint_complete_sha256") != best["complete_sha256"]
+            or result["scores"]["rouge2"] != best["rouge2"]):
+        raise ValueError("Best pointer and monitoring evidence disagree")
+    return pinned
+
+
 def prune(run_dir):
     choices = completed(run_dir)
+    pinned = best_checkpoint(run_dir)
     for path in choices[:-2]:
+        if path == pinned:
+            continue
         if path.parent.resolve() != (run_dir / "checkpoints").resolve() or path.is_symlink():
             raise ValueError("Unsafe checkpoint deletion target")
         shutil.rmtree(path)

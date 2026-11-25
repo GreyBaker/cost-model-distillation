@@ -45,8 +45,8 @@ def load(path, device, trainable, value):
     return tokenizer, model
 
 
-def loss_sum(model, inputs, labels):
-    """Teacher-forced CE sum; caller normalizes over the effective batch tokens."""
+def loss_sum(model, inputs, labels, z_loss=0.0):
+    """Summed CE + optional masked T5 z-loss; caller owns batch normalization."""
     import torch
     import torch.nn.functional as F
     valid = labels.ne(-100)
@@ -55,7 +55,14 @@ def loss_sum(model, inputs, labels):
     shifted = model.prepare_decoder_input_ids_from_labels(labels=labels)
     mask = torch.cat([torch.ones_like(valid[:, :1]), valid[:, :-1]], dim=1)
     output = model(**inputs, decoder_input_ids=shifted, decoder_attention_mask=mask, use_cache=False)
-    return F.cross_entropy(output.logits.float().transpose(1, 2), labels, ignore_index=-100, reduction="sum")
+    logits = output.logits.float()
+    ce = F.cross_entropy(logits.transpose(1, 2), labels, ignore_index=-100, reduction="sum")
+    if not z_loss:
+        return ce
+    # T5X z-loss constrains the softmax log partition. Padding contributes
+    # neither CE nor z-loss; EOS is an ordinary supervised token.
+    log_z = torch.logsumexp(logits, dim=-1)
+    return ce + z_loss * log_z.square().masked_fill(~valid, 0.0).sum()
 
 
 def generate(model, tokenizer, inputs, limit):

@@ -9,8 +9,8 @@ import sys
 import time
 import uuid
 
-from . import assets, checkpoints, data
-from .core import ROOT, atomic_json, code_signature, read_json, sha256
+from . import assets, checkpoints, data, monitoring
+from .core import ROOT, atomic_json, check_teacher_work, code_signature, read_json, sha256
 from .resume import PARTITION, config_compatible, effective_batch
 from .console import message, run_logged
 
@@ -228,6 +228,7 @@ def run(root, config_dir, value, *, resume=None, session_updates=None, pilot_onl
     """Model-free supervisor; each probe/retry runs in a new isolated process."""
     from .sequence import ChildStop
     work = root / value["role"]
+    check_teacher_work(work, value)
     assets.verify(work, value)
     data.verify(work, value)
     run_exists = (work / "runs" / value["run_name"] / "run.json").exists()
@@ -237,7 +238,7 @@ def run(root, config_dir, value, *, resume=None, session_updates=None, pilot_onl
         raise ValueError("No SFT run to resume")
     checkpoint = latest(work, value) if run_exists else None
     start = read_json(checkpoint / "COMPLETE.json")["step"] if checkpoint else 0
-    if start == value["max_steps"]:
+    if start == value["max_steps"] and monitoring.finished(checkpoint.parent.parent, value, start):
         message(f"{value['role'].title()} SFT already complete; no pilot or training launched.")
         return
     if session_updates is not None and (type(session_updates) is not int or session_updates < 1):
@@ -261,10 +262,12 @@ def run(root, config_dir, value, *, resume=None, session_updates=None, pilot_onl
         while not stop.requested:
             checkpoint = latest(work, value)
             step = read_json(checkpoint / "COMPLETE.json")["step"] if checkpoint else 0
-            if step >= target:
+            if step >= target and (checkpoint is None or monitoring.finished(checkpoint.parent.parent, value, step)):
                 return
             size = active_microbatch(work, value, runtime)
-            extra = ["--microbatch", size, "--session-updates", target - step]
+            extra = ["--microbatch", size]
+            if target > step:
+                extra += ["--session-updates", target - step]
             if checkpoint:
                 extra += ["--resume", "latest"]
             try:
@@ -385,10 +388,14 @@ def pilot_worker(work, value, microbatch, output):
         before = time.monotonic()
         validation = training.validation_loss(model, tokenizer, datasets["validation"], value, device)
         validation_seconds = time.monotonic() - before
+        greedy_monitor = None
+        if value.get("rouge_every_steps"):
+            greedy_monitor = monitoring.measure(model, tokenizer, datasets["validation"], value, device)
         peak = max(peak, torch.cuda.max_memory_reserved(device))
         result = {"status": "pass" if peak <= runtime["total_memory"] * RESERVED_FRACTION_LIMIT else "headroom",
                   "peak_reserved_bytes": peak, "updates": records, "resumed_update": resumed,
                   "validation": validation, "save_reload_verified": True,
+                  "greedy_monitor": greedy_monitor,
                   "checkpoint_seconds": checkpoint_seconds, "validation_seconds": validation_seconds,
                   "initialization_seconds": initialization_seconds,
                   "pilot_checkpoint": str(saved),

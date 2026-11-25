@@ -22,6 +22,8 @@ KEYS = {"role", "run_name", "max_steps", "seed", "data_seed", "prefix", "max_sou
         "max_target_tokens", "microbatch_size", "gradient_accumulation_steps", "learning_rate",
         "warmup_steps", "dropout", "gradient_checkpointing", "save_every_steps", "keep_checkpoints",
         "eval_every_steps", "eval_examples", "evaluation_batch_size", "gpu_memory_warning_gib"}
+TEACHER_KEYS = {"recipe", "scale_parameter", "cooldown_start_step", "loss_normalizing_factor",
+                "z_loss", "rouge_every_steps", "rouge_examples", "review_step"}
 
 
 def read_json(path):
@@ -136,8 +138,9 @@ def config(role, directory=CONFIGS):
     if role not in STEPS:
         raise ValueError("Unknown preparation role")
     value = read_json(Path(directory) / f"{role}.json")
-    if set(value) != KEYS:
-        raise ValueError(f"Missing/unknown config fields: {set(value) ^ KEYS}")
+    expected = KEYS | (TEACHER_KEYS if role == "teacher" else set())
+    if set(value) != expected:
+        raise ValueError(f"Missing/unknown config fields: {set(value) ^ expected}")
     if value["role"] != role or value["max_steps"] != STEPS[role]:
         raise ValueError("Role/step budget must match Appendix A.2 (student 100K, teacher 8K)")
     name = value["run_name"]
@@ -157,9 +160,25 @@ def config(role, directory=CONFIGS):
     if value["learning_rate"] <= 0 or value["gpu_memory_warning_gib"] <= 0 or not 0 <= value["dropout"] < 1:
         raise ValueError("Invalid LR/VRAM advisory/dropout")
     if value["keep_checkpoints"] != 2 or value["warmup_steps"] > value["max_steps"]:
-        raise ValueError("Retain exactly two checkpoints; warmup must fit budget")
+        raise ValueError("Retain two recent checkpoints (plus pinned best); warmup must fit budget")
     if type(value["gradient_checkpointing"]) is not bool or not isinstance(value["prefix"], str):
         raise ValueError("Invalid gradient checkpointing/prefix")
+    if role == "teacher":
+        if value["recipe"] != "t5x_xsum_xl_adapted_v1" or value["scale_parameter"] is not True:
+            raise ValueError("Teacher requires the declared parameter-scaled researched recipe")
+        for key in ("cooldown_start_step", "loss_normalizing_factor", "rouge_every_steps",
+                    "rouge_examples", "review_step"):
+            if type(value[key]) is not int or value[key] < 1:
+                raise ValueError(f"{key} must be a positive integer")
+        if (not value["warmup_steps"] <= value["cooldown_start_step"] < value["max_steps"]
+                or value["rouge_examples"] > 11332 or value["review_step"] >= value["max_steps"]
+                or value["review_step"] % value["rouge_every_steps"]
+                or value["rouge_every_steps"] % value["save_every_steps"]
+                or value["max_steps"] % value["rouge_every_steps"]):
+            raise ValueError("Invalid teacher cooldown/ROUGE/review/checkpoint boundaries")
+        if (type(value["z_loss"]) not in (int, float) or not math.isfinite(value["z_loss"])
+                or value["z_loss"] < 0):
+            raise ValueError("Invalid teacher z-loss coefficient")
     return value
 
 
@@ -174,12 +193,50 @@ def asset_spec(value):
     return {"model": spec[value["role"]], "xsum": spec["xsum"]}
 
 
+def check_teacher_work(work, value):
+    """Refuse mixing old/new teacher experiments, including standalone runs."""
+    if value["role"] != "teacher":
+        return
+    from .resume import config_compatible
+    for path in sorted((Path(work) / "runs").glob("*/run.json")):
+        if not config_compatible(read_json(path)["config"], value):
+            raise ValueError("Existing teacher uses a different recipe/run. Preserve it and use a NEW SFT_WORK "
+                             "containing only the restored student; do not resume old teacher weights.")
+
+
+def recipe_evidence(value):
+    if value["role"] != "teacher":
+        return None
+    return {
+        "recipe": value["recipe"],
+        "source": "https://github.com/GoogleCloudPlatform/t5x-on-vertex-ai/blob/"
+                  "7ea890cd306ab924572bb2aaadadbfbc410032b3/configs/finetune_t511_xl_xsum.gin",
+        "public_precedent": "batch256, 9K updates, scaled Adafactor coefficient5e-4, "
+                            "dropout0.1, train512/64, inference1024/64, normalizer233472",
+        "adaptations": f"batch{value['microbatch_size'] * value['gradient_accumulation_steps']}, "
+                       f"{value['max_steps']} updates, source{value['max_source_tokens']}, "
+                       f"warmup{value['warmup_steps']}/cooldown{value['cooldown_start_step']}-{value['max_steps']}, "
+                       "pinned LM-adapted XL with fresh optimizer, local fixed-shape unpacked data",
+        "normalization": f"Summed valid-token CE plus z-loss{value['z_loss']} divided by"
+                         f"{value['loss_normalizing_factor']} once per full update; "
+                         "no batch-size, token-count or accumulation rescaling",
+        "boundary": "Research-supported adaptation, not exact GKD-author SFT or a demonstrated optimum",
+    }
+
+
 def checkpoint_due(value, step, stopping=False):
     return stopping or step == value["max_steps"] or (step > 0 and step % value["save_every_steps"] == 0)
 
 
 def lr_for_update(value, completed):
-    return value["learning_rate"] * min(1.0, (completed + 1) / max(1, value["warmup_steps"]))
+    warmup = min(1.0, (completed + 1) / max(1, value["warmup_steps"]))
+    cooldown = 1.0
+    if "cooldown_start_step" in value:
+        # completed counts successful updates; the last update has a nonzero
+        # coefficient, with the linear schedule reaching zero at the endpoint.
+        cooldown = max(0.0, min(1.0, (value["max_steps"] - completed)
+                              / (value["max_steps"] - value["cooldown_start_step"])))
+    return value["learning_rate"] * warmup * cooldown
 
 
 def data_signature(value):

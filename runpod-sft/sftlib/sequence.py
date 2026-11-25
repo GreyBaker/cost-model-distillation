@@ -10,8 +10,8 @@ import sys
 import time
 import uuid
 
-from . import assets, checkpoints, data, inference
-from .core import ROOT, SPEC, RunLock, atomic_json, code_signature, config, read_json, sha256
+from . import assets, checkpoints, data, inference, monitoring
+from .core import ROOT, SPEC, RunLock, atomic_json, check_teacher_work, code_signature, config, read_json, sha256
 from .resume import config_compatible, record_migration
 from .console import message, run_logged
 
@@ -28,7 +28,8 @@ def training_complete(work, value):
     run = read_json(run_dir / "run.json")
     checkpoint = checkpoints.resolve(run_dir)
     marker = checkpoints.verify(checkpoint, run["run_id"])
-    return config_compatible(run["config"], value) and marker["step"] == value["max_steps"]
+    return (config_compatible(run["config"], value) and marker["step"] == value["max_steps"]
+            and monitoring.finished(run_dir, value, marker["step"]))
 
 
 def verified_role(root, config_dir, role):
@@ -124,6 +125,8 @@ def run(root, config_dir, reuse_student=False, reuse_sft=False):
     # workers. Source hashes and historical GPU/software are not reuse blockers.
     reuse_roles = ORDER if reuse_sft else ("student",) if reuse_student else ()
     reused = {role: verified_role(root, config_dir, role) for role in reuse_roles}
+    if not reuse_sft:
+        check_teacher_work(root / "teacher", values["teacher"])
     definition = {"order": list(ORDER), "configs": values, "assets_spec_sha256": sha256(SPEC),
                   "code": code_signature(), "automatic_time_limit": None}
     root.mkdir(parents=True, exist_ok=True)
