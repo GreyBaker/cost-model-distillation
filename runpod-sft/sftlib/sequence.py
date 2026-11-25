@@ -31,6 +31,64 @@ def training_complete(work, value):
     return config_compatible(run["config"], value) and marker["step"] == value["max_steps"]
 
 
+def verified_role(root, config_dir, role):
+    """Read-only verification of a restored SFT role; never load/train a model."""
+    value = config(role, config_dir)
+    work = (root / role).resolve()
+    run_dir = work / "runs" / value["run_name"]
+    if not (run_dir / "run.json").is_file():
+        raise ValueError(f"Restore the complete pre-SFTed {role} role under SFT_WORK/{role} first")
+    run = read_json(run_dir / "run.json")
+    if not config_compatible(run["config"], value):
+        raise ValueError(f"Restored {role} recipe differs; use its compatible {role} config")
+    assets.verify(work, value)
+    data.verify(work, value)
+    if (run["signatures"]["assets"] != sha256(work / "assets/manifest.json")
+            or run["signatures"]["prepared"] != sha256(work / "prepared/manifest.json")):
+        raise ValueError(f"Restored {role} assets/prepared data differ from its training provenance")
+    checkpoint = checkpoints.resolve(run_dir)
+    marker = checkpoints.verify(checkpoint, run["run_id"])
+    if marker["step"] != value["max_steps"]:
+        raise ValueError(f"Reuse requires the complete {value['max_steps']:,}-update {role}, not partial SFT")
+    export_dir = inference.export_path(work, value)
+    exported = inference.verify_export(export_dir)
+    provenance = read_json(export_dir / "provenance.json")
+    if (exported.get("role") != role or exported.get("step") != value["max_steps"]
+            or provenance.get("partial") is not False or provenance["source_run"] != run
+            or provenance["source_checkpoint_complete_sha256"] != sha256(checkpoint / "COMPLETE.json")):
+        raise ValueError(f"Restored {role} export does not match its final FP32 checkpoint")
+    # A copied role can retain an old absolute latest_evaluation pointer. Discover
+    # complete local evaluations without modifying that pointer or any manifest.
+    candidates = [work / "evaluation"]
+    pointer = work / "latest_evaluation.json"
+    if pointer.is_file():
+        pointed = Path(read_json(pointer)["path"]).resolve()
+        if pointed.is_relative_to(work):
+            candidates.append(pointed)
+    candidates.extend(sorted(work.glob("evaluation-retry-*")))
+    seen = set()
+    for output in candidates:
+        output = output.resolve()
+        if output in seen or not output.is_relative_to(work):
+            continue
+        seen.add(output)
+        metrics_path = output / "metrics.json"
+        if not metrics_path.is_file():
+            continue
+        metrics = read_json(metrics_path)
+        if metrics.get("status") != "complete" or metrics.get("n") != data.COUNTS["validation"]:
+            continue
+        metrics = inference.verify_evaluation(work, value, output, export_dir, data.COUNTS["validation"])
+        return {"fp32_checkpoint": str(checkpoint), "bf16_export": str(export_dir),
+                "export_complete_sha256": sha256(export_dir / "COMPLETE.json"),
+                "evaluation": str(output), "metrics": metrics}
+    raise ValueError(f"Restore a complete 11,332-example {role} evaluation before reuse")
+
+
+def verified_student(root, config_dir):
+    return verified_role(root, config_dir, "student")
+
+
 class ChildStop:
     def __init__(self):
         self.requested, self.child, self.previous = False, None, {}
@@ -55,11 +113,17 @@ class ChildStop:
             signal.signal(number, previous)
 
 
-def run(root, config_dir):
+def run(root, config_dir, reuse_student=False, reuse_sft=False):
+    if reuse_student and reuse_sft:
+        raise ValueError("Choose student-only reuse or complete-pair reuse, not both")
     values = {role: config(role, config_dir) for role in ORDER}
     if any(values["student"][name] != values["teacher"][name]
            for name in ("prefix", "max_source_tokens", "max_target_tokens")):
         raise ValueError("Both roles must share prompt/source/target protocol for later GKD")
+    # Fail before creating outputs, downloading/training teacher, or launching GPU
+    # workers. Source hashes and historical GPU/software are not reuse blockers.
+    reuse_roles = ORDER if reuse_sft else ("student",) if reuse_student else ()
+    reused = {role: verified_role(root, config_dir, role) for role in reuse_roles}
     definition = {"order": list(ORDER), "configs": values, "assets_spec_sha256": sha256(SPEC),
                   "code": code_signature(), "automatic_time_limit": None}
     root.mkdir(parents=True, exist_ok=True)
@@ -77,11 +141,20 @@ def run(root, config_dir):
             atomic_json(path, definition)
         # Fail before a lengthy student run if teacher inputs were not prepared.
         for role in ORDER:
+            if role in reused:
+                continue
             assets.verify(root / role, values[role])
             data.verify(root / role, values[role])
         logs = root / "logs"
         logs.mkdir(exist_ok=True)
-        results = {}
+        results = dict(reused)
+        if reused:
+            atomic_json(root / "reused_sft.json", {
+                "status": "verified", "roles": reused, "training_launched_for_reused_roles": False,
+                "source_checkpoint_complete_sha256": {
+                    role: sha256(Path(result["fp32_checkpoint"]) / "COMPLETE.json")
+                    for role, result in reused.items()},
+                "note": "Restored role folders verified read-only; no train/export/evaluation worker for reused roles."})
 
         def status(phase, **extra):
             atomic_json(root / "status.json", {"phase": phase, "wall_time_unix": time.time(), **extra})
@@ -105,6 +178,9 @@ def run(root, config_dir):
                     if stop.requested:
                         status("paused")
                         return
+                    if role in reused:
+                        status(f"{role}_reused", checkpoint=reused[role]["fp32_checkpoint"])
+                        continue
                     value = values[role]
                     work = root / role
                     run_dir = work / "runs" / value["run_name"]

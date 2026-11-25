@@ -57,6 +57,12 @@ def main():
     evaluate.add_argument("--limit", type=int, default=0, help="0 = all 11,332 validation examples")
     run = commands.add_parser("run", help="ON THE POD: serial student train/export/eval, then teacher train/export/eval")
     run.add_argument("--accept-reconstructed-recipe", action="store_true")
+    reuse = run.add_mutually_exclusive_group()
+    reuse.add_argument("--reuse-student", action="store_true",
+                     help="Verify existing complete student role read-only; skip its train/export/evaluation workers")
+    reuse.add_argument("--reuse-sft", action="store_true",
+                       help="Verify both restored complete roles and rebuild the pair manifest; no SFT workers")
+    commands.add_parser("verify-student", help="Read-only hashes/provenance/full-evaluation check of a restored SFT student")
     commands.add_parser("status", help="Read-only status of both roles; no ML imports")
     estimate = commands.add_parser("estimate", help="Read-only pilot-based remaining/full training time and compute USD")
     estimate.add_argument("--role", choices=["student", "teacher"], required=True)
@@ -80,6 +86,10 @@ def main():
         result["sequence"] = read_json(root / "status.json") if (root / "status.json").exists() else None
         display(result, "SFT status", args.json)
         return
+    if operation == "verify-student":
+        from sftlib.sequence import verified_student
+        display(verified_student(root, config_dir), "Reusable SFT student", args.json)
+        return
     if operation == "verify-export":
         from sftlib.inference import verify_export
         marker = verify_export(args.directory.resolve())
@@ -91,12 +101,14 @@ def main():
         value = config(args.role, config_dir)
         display(report(root / args.role, value, args.hourly_rate), "SFT runtime estimate", args.json)
         return
+    if any(path.name.lower() == "results_and_temp" for path in (root, *root.parents)):
+        raise ValueError("results_and_temp is immutable; restore copies into a separate SFT work directory")
     if operation == "run":
-        if not args.accept_reconstructed_recipe:
+        if not args.accept_reconstructed_recipe and not args.reuse_sft:
             raise ValueError("Read DECISIONS.md, then pass --accept-reconstructed-recipe")
         configure_local_storage(root)
         from sftlib.sequence import run
-        run(root, config_dir)
+        run(root, config_dir, reuse_student=args.reuse_student, reuse_sft=args.reuse_sft)
         return
     if operation == "prepare" and args.role == "both":
         configure_local_storage(root)
