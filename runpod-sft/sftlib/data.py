@@ -76,6 +76,11 @@ def target_count(rows):
 
 def batch(tokenizer, rows, device, limits=None):
     import torch
+    # Inputs are intentionally pretokenized/cached. Re-encoding with __call__
+    # would repeat work; silence only this fast-tokenizer padding advisory.
+    notices = getattr(tokenizer, "deprecation_warnings", None)
+    if isinstance(notices, dict):
+        notices["Asking-to-pad-a-fast-tokenizer"] = True
     options = {"padding": True} if limits is None else {"padding": "max_length", "max_length": limits["max_source_tokens"]}
     inputs = tokenizer.pad([{"input_ids": row["input_ids"]} for row in rows],
                            return_attention_mask=True, return_tensors="pt", **options).to(device)
