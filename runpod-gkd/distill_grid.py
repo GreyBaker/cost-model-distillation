@@ -19,7 +19,7 @@ def main():
     parser.add_argument("--json", action="store_true", help="JSON for plan/summary/estimate/audit reports")
     commands = parser.add_subparsers(dest="command")
     commands.add_parser("plan", help="Read-only grid/count/runtime scenarios; no ML imports")
-    commands.add_parser("bind", help="After SFT only: verify/freeze completed pair (hashes; no GPU/model load)")
+    commands.add_parser("bind", help="Verify/freeze completed SFT or approved external pair (hashes; no GPU/model load)")
     commands.add_parser("pilot", help="ON POD: once-only training fit and evaluation batch pilots, then full baseline")
     commands.add_parser("estimate", help="Read-only measured full-grid estimate from saved pilot/baseline")
     run = commands.add_parser("run", help="Print estimate; execute only with --accept-estimate")
@@ -64,7 +64,9 @@ def main():
     with RunLock(root / lock_name):
         bound = binding(root, sft_work, settings, create=operation == "bind", full=operation == "bind")
         if operation == "bind":
-            print("Verified completed 100K/8K SFT pair; no model loaded or GPU used.")
+            print("Verified validated external pair; no model loaded or GPU used."
+                  if bound["inputs"].get("kind") == "validated-external-pair-v1"
+                  else "Verified completed 100K/8K SFT pair; no model loaded or GPU used.")
         elif operation == "audit":
             from gridlib.audit import audit
             result = audit(root, bound)

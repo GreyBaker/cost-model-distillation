@@ -112,6 +112,9 @@ def chunks(rows, branch_flags, microbatch, rng):
 def code_signature():
     paths = [ROOT / "distill_grid.py", *sorted((ROOT / "gridlib").glob("*.py")),
              *sorted((SFT_CODE / "sftlib").glob("*.py"))]
+    external = ROOT.parent / "runpod-external-teacher"
+    if (external / "external_teacher.py").is_file():
+        paths += [external / "external_teacher.py", *sorted((external / "external_workflow").glob("*.py"))]
     return {p.relative_to(ROOT.parent).as_posix(): sha256(p) for p in paths}
 
 

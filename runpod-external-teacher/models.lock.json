@@ -1,0 +1,80 @@
+{
+  "schema": "external-xsum-sources-v1",
+  "metadata_checked_on": "2026-11-25",
+  "metadata_only": true,
+  "weights_downloaded_or_evaluated_here": false,
+  "small_file_hash_note": "git_blob_sha1 is SHA1(b'blob ' + ascii(byte_count) + b'\\0' + file_bytes), NOT raw-file SHA1. Record raw-file SHA256 too when importing on Pod.",
+  "models": {
+    "teacher": {
+      "repo_id": "yoshitomo-matsubara/t5_xl-xsum",
+      "revision": "8c1c8750df7cf0c35ca524efb4b02fbb44273856",
+      "claimed_base_model": "google/t5-xl-lm-adapt",
+      "publisher_reported_sft_steps": 8000,
+      "publisher_reported_validation_rouge2": 21.370101928710938,
+      "publisher_reported_training_split": "train[:99%]",
+      "publisher_reported_seed": 42,
+      "publisher_pinned_dataset_revision": false,
+      "license": "Apache-2.0",
+      "saved_transformers_version": "5.20.2",
+      "saved_config": {"tie_word_embeddings": true, "scale_decoder_outputs": false},
+      "files": [
+        {"path": "LICENSE", "bytes": 11358, "git_blob_sha1": "d645695673349e3947e8e5ae42332d0ac3164cd7"},
+        {"path": "README.md", "bytes": 12145, "git_blob_sha1": "3cb364fcb31b86092a7030e6808ea122754b7ba0"},
+        {"path": "config.json", "bytes": 801, "git_blob_sha1": "b1d7e3f6d2034c6700c205df81d7e728d9cad835"},
+        {"path": "generation_config.json", "bytes": 142, "git_blob_sha1": "8b703b56228a6747e27d9c031977ef07da3f4a02"},
+        {"path": "model.safetensors", "bytes": 11925483040, "sha256": "a55a3a428a93d43722f86cd3e810928a9c06aa076f6ad9449d83a3ddaf9e7ad7"},
+        {"path": "tokenizer.json", "bytes": 2424069, "git_blob_sha1": "7093f0b3e6e8c7cc8a69b6b72d1cf2824803ae88"},
+        {"path": "tokenizer_config.json", "bytes": 2381, "git_blob_sha1": "7a9aa79af44d2ab697ca2a18a4e0e13a8a2dc70f"},
+        {"path": "logs/args.json", "bytes": 285, "git_blob_sha1": "35e286a63f35e8efec37796a3b8dc254452f1663"},
+        {"path": "logs/config.yaml", "bytes": 7130, "git_blob_sha1": "79dce22072860842c7ad92e8106cc7963acc81c3"},
+        {"path": "logs/metrics.json", "bytes": 364, "git_blob_sha1": "a9f70c84b3bd562d30fcaa6779ebec834c2c9cd0"},
+        {"path": "logs/trackio/run_manifest.json", "bytes": 100, "git_blob_sha1": "7734705d62eef53706263b2cafc3d9d0f43b39ef"},
+        {"path": "logs/trackio/summary.csv", "bytes": 3822, "git_blob_sha1": "aa400e2366ae984a0c8e20e2521e0a85916b3109"}
+      ]
+    },
+    "public_student": {
+      "repo_id": "yoshitomo-matsubara/t5_small-xsum",
+      "revision": "9d38a9844f1fce1309bfb150c03525413d7ac5bf",
+      "claimed_base_model": "google/t5-small-lm-adapt",
+      "publisher_reported_sft_steps": 100000,
+      "publisher_reported_validation_rouge2": 16.055376052856445,
+      "publisher_reported_training_split": "train[:99%]",
+      "publisher_reported_seed": 42,
+      "publisher_pinned_dataset_revision": false,
+      "license": "Apache-2.0",
+      "saved_transformers_version": "5.20.2",
+      "saved_config": {"tie_word_embeddings": true, "scale_decoder_outputs": false},
+      "files": [
+        {"path": "LICENSE", "bytes": 11358, "git_blob_sha1": "d645695673349e3947e8e5ae42332d0ac3164cd7"},
+        {"path": "README.md", "bytes": 10521, "git_blob_sha1": "93482d66ad702f96eb24b8d90613041ad3f19a57"},
+        {"path": "config.json", "bytes": 797, "git_blob_sha1": "89c66ad4f7013982ab670b2cef38b0b749f549c7"},
+        {"path": "generation_config.json", "bytes": 142, "git_blob_sha1": "8b703b56228a6747e27d9c031977ef07da3f4a02"},
+        {"path": "model.safetensors", "bytes": 307867048, "sha256": "5d9348b71e1106144ed7d582dd33850a1350cf12e85b277143c8b1818dc09507"},
+        {"path": "tokenizer.json", "bytes": 2424069, "git_blob_sha1": "7093f0b3e6e8c7cc8a69b6b72d1cf2824803ae88"},
+        {"path": "tokenizer_config.json", "bytes": 2381, "git_blob_sha1": "7a9aa79af44d2ab697ca2a18a4e0e13a8a2dc70f"},
+        {"path": "logs/args.json", "bytes": 279, "git_blob_sha1": "cc271562fe63b4f69df186f981b3af0ff53e597a"},
+        {"path": "logs/config.yaml", "bytes": 6111, "git_blob_sha1": "fc02e523ce4d5f63e7d0f2fc74e2a247d45d30ca"},
+        {"path": "logs/metrics.json", "bytes": 368, "git_blob_sha1": "35feca3bc60c6db72bfc23dfc192106aef700c63"},
+        {"path": "logs/trackio/run_manifest.json", "bytes": 97, "git_blob_sha1": "f0abcc59d89e6aed6d68905d06b99231e41e3eed"},
+        {"path": "logs/trackio/summary.csv", "bytes": 23471, "git_blob_sha1": "923daf5e347348ab40cf75449f364395d22dfd4d"}
+      ]
+    }
+  },
+  "evaluation_data": {
+    "repo_id": "EdinburghNLP/xsum",
+    "revision": "7d4d486c2f8ef850b1a11aead99b894ff3dd7da9",
+    "counts": {"train": 204045, "validation": 11332},
+    "files": [
+      {"path": "data/train-00000-of-00001.parquet", "bytes": 299612457, "sha256": "0bba72d330f2a35ba20321444e54724e487b49f2eab6b26625b5f282d1c797c9"},
+      {"path": "data/validation-00000-of-00001.parquet", "bytes": 16447668, "sha256": "b7fc808c2dd3d1340349481aeef489e6eb8c22ff5739d8bce6d0f99e5ef8044d"}
+    ]
+  },
+  "references": [
+    "https://huggingface.co/yoshitomo-matsubara/t5_xl-xsum/tree/8c1c8750df7cf0c35ca524efb4b02fbb44273856",
+    "https://huggingface.co/yoshitomo-matsubara/t5_small-xsum/tree/9d38a9844f1fce1309bfb150c03525413d7ac5bf",
+    "https://github.com/huggingface/transformers/blob/v5.20.2/src/transformers/models/t5/configuration_t5.py",
+    "https://github.com/huggingface/transformers/blob/v5.20.2/src/transformers/modeling_utils.py",
+    "https://github.com/huggingface/transformers/blob/v4.57.6/src/transformers/models/t5/modeling_t5.py",
+    "https://arxiv.org/html/2306.13649v3/"
+  ]
+}

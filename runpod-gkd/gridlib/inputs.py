@@ -21,6 +21,14 @@ def inspect_pair(sft_work, full=True):
     sft_work = Path(sft_work).resolve()
     pair_path = sft_work / "prepared_pair.json"
     pair = read_json(pair_path)
+    if pair.get("kind") == "validated-external-pair-v1":
+        import sys
+        external_code = SFT_CODE.parent / "runpod-external-teacher"
+        if not (external_code / "external_workflow/pair.py").is_file():
+            raise ValueError("Keep runpod-external-teacher alongside the grid and SFT packages")
+        sys.path.insert(0, str(external_code))
+        from external_workflow.pair import inspect
+        return inspect(sft_work, full=full)
     if pair.get("status") != "complete" or set(pair.get("roles", {})) != {"student", "teacher"}:
         raise ValueError("Both SFT roles must finish before binding/running GKD")
     paths, configs, hashes = {}, {}, {"prepared_pair": sha256(pair_path)}

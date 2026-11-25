@@ -27,13 +27,25 @@ def load(path, device, trainable, value):
     from transformers import AutoConfig, AutoModelForSeq2SeqLM, AutoTokenizer
     tokenizer = AutoTokenizer.from_pretrained(path, local_files_only=True, trust_remote_code=False)
     model_config = AutoConfig.from_pretrained(path, local_files_only=True, trust_remote_code=False)
+    profile = getattr(model_config, "external_pair_profile", None)
+    if profile is not None:
+        from importlib.metadata import version
+        if profile != "native-t5-5.20.2-v1" or version("transformers") != "5.20.2":
+            raise ValueError("Imported T5 artifacts require their isolated native Transformers 5.20.2 runtime")
+        if getattr(model_config, "scale_decoder_outputs", None) is not False:
+            raise ValueError("Imported teacher/student decoder scaling changed")
+        if (model_config.vocab_size != 32128 or model_config.decoder_start_token_id != 0
+                or model_config.pad_token_id != 0 or model_config.eos_token_id != 1):
+            raise ValueError("Imported T5 vocabulary/special-token semantics changed")
     if model_config.model_type != "t5" or not model_config.is_encoder_decoder:
         raise ValueError("Expected a T5 encoder-decoder checkpoint")
     if trainable:
         model_config.dropout_rate = value["dropout"]
+    precision = {"dtype" if profile is not None else "torch_dtype":
+                 torch.float32 if trainable else torch.bfloat16}
     model = AutoModelForSeq2SeqLM.from_pretrained(
-        path, config=model_config, torch_dtype=torch.float32 if trainable else torch.bfloat16,
-        device_map={"": str(device)}, low_cpu_mem_usage=True, weights_only=True,
+        path, config=model_config, **precision,
+        device_map={"": str(device)}, low_cpu_mem_usage=True, weights_only=True, attn_implementation="eager",
         local_files_only=True, trust_remote_code=False)
     if trainable:
         model.train()
@@ -41,6 +53,8 @@ def load(path, device, trainable, value):
         if value["gradient_checkpointing"]:
             model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
     else:
+        if profile is not None:
+            model.to(torch.bfloat16)
         model.requires_grad_(False).eval()
     return tokenizer, model
 
