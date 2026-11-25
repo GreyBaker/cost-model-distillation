@@ -82,28 +82,74 @@ def validation_loss(model, tokenizer, dataset, value, device):
     return {"validation_loss": total / tokens, "validation_n": len(indices), "validation_target_tokens": tokens}
 
 
+def runtime(value):
+    import torch
+    device = modeling.cuda_device(value)
+    torch.backends.cuda.matmul.allow_tf32 = False
+    torch.backends.cudnn.allow_tf32 = False
+    info = environment()
+    info.update(gpu=torch.cuda.get_device_name(device), cuda=torch.version.cuda,
+                visible_gpus=torch.cuda.device_count(), capability=list(torch.cuda.get_device_capability(device)))
+    return device, info
+
+
+def optimizer(model, value):
+    from transformers import Adafactor
+    return Adafactor(model.parameters(), lr=value["learning_rate"], eps=(1e-30, 1e-3),
+                     clip_threshold=1.0, decay_rate=-0.8, beta1=None, weight_decay=0.0,
+                     scale_parameter=False, relative_step=False, warmup_init=False)
+
+
+def update(model, tokenizer, opt, rows, value, device):
+    """Same full-effective-batch SFT update for real training and discarded fit probes."""
+    import torch
+    count = value["microbatch_size"] * value["gradient_accumulation_steps"]
+    if len(rows) != count:
+        raise ValueError("SFT update must preserve its complete effective batch")
+    opt.zero_grad(set_to_none=True)
+    torch.cuda.synchronize(device)
+    before = time.monotonic()
+    denominator = data.target_count(rows)
+    total_loss, source_tokens, target_tokens = 0.0, 0, 0
+    for offset in range(0, count, value["microbatch_size"]):
+        batch = rows[offset:offset + value["microbatch_size"]]
+        inputs, labels = data.batch(tokenizer, batch, device, limits=value)
+        source_tokens += int(inputs["attention_mask"].sum().item())
+        target_tokens += data.target_count(batch)
+        with torch.autocast("cuda", dtype=torch.bfloat16):
+            loss = modeling.loss_sum(model, inputs, labels) / denominator
+        if not torch.isfinite(loss):
+            raise FloatingPointError("Nonfinite SFT loss; no precision fallback")
+        total_loss += float(loss.detach().item())
+        loss.backward()
+        del loss, inputs, labels
+    norm = torch.nn.utils.clip_grad_norm_(model.parameters(), float("inf"), error_if_nonfinite=True)
+    opt.step()
+    opt.zero_grad(set_to_none=True)
+    torch.cuda.synchronize(device)
+    return {"loss": total_loss, "gradient_norm": float(norm),
+            "source_tokens": source_tokens, "target_tokens": target_tokens,
+            "update_seconds": time.monotonic() - before,
+            "peak_allocated_bytes": torch.cuda.max_memory_allocated(device),
+            "peak_reserved_bytes": torch.cuda.max_memory_reserved(device)}
+
+
 def train(work, value, resume=None, session_updates=None):
     import torch
-    from transformers import Adafactor
     started = time.monotonic()
     if session_updates is not None and (type(session_updates) is not int or session_updates < 1):
         raise ValueError("Pilot cap must be a positive additional update count")
     run_dir = work / "runs" / value["run_name"]
     assets.verify(work, value)
     data.verify(work, value)
-    device = modeling.cuda_device(value)
-    torch.backends.cuda.matmul.allow_tf32 = False
-    torch.backends.cudnn.allow_tf32 = False
-    runtime = environment()
-    runtime.update(gpu=torch.cuda.get_device_name(device), cuda=torch.version.cuda,
-                   visible_gpus=torch.cuda.device_count(), capability=list(torch.cuda.get_device_capability(device)))
+    device, runtime_info = runtime(value)
     signatures = {"assets": sha256(work / "assets/manifest.json"),
                   "prepared": sha256(work / "prepared/manifest.json"), "code": code_signature()}
     checkpoint = None
     if resume:
         run = read_json(run_dir / "run.json")
         if (not config_compatible(run["config"], value)
-                or not signatures_compatible(run["signatures"], signatures) or run["runtime"] != runtime):
+                or not signatures_compatible(run["signatures"], signatures) or run["runtime"] != runtime_info):
             raise ValueError("Resume refused: effective batch, recipe, assets/data, software or GPU changed")
         checkpoint = checkpoints.resolve(run_dir, resume)
         marker = checkpoints.verify(checkpoint, run["run_id"])
@@ -117,22 +163,20 @@ def train(work, value, resume=None, session_updates=None):
         if run_dir.exists():
             raise FileExistsError(f"Run exists; use --resume latest: {run_dir}")
         run_dir.mkdir(parents=True)
-        run = {"run_id": uuid.uuid4().hex, "config": value, "signatures": signatures, "runtime": runtime}
+        run = {"run_id": uuid.uuid4().hex, "config": value, "signatures": signatures, "runtime": runtime_info}
         atomic_json(run_dir / "run.json", run)
     session_id = uuid.uuid4().hex
     log_dir = run_dir / "sessions"
     log_dir.mkdir(exist_ok=True)
     log_path = log_dir / f"{session_id}.jsonl"
     atomic_json(log_dir / f"{session_id}.json", {"checkpoint": str(checkpoint) if checkpoint else None,
-                "session_updates": session_updates, "runtime": runtime,
+                "session_updates": session_updates, "runtime": runtime_info,
                 "execution_config": value, "execution_signatures": signatures})
     atomic_json(run_dir / "status.json", {"status": "initializing", "session_id": session_id})
     seed(value["seed"])
     message(f"Loading {value['role']} SFT model" + (" and restart state..." if checkpoint else "..."))
     tokenizer, model = modeling.load(checkpoint or work / "assets/model", device, True, value)
-    optimizer = Adafactor(model.parameters(), lr=value["learning_rate"], eps=(1e-30, 1e-3),
-                         clip_threshold=1.0, decay_rate=-0.8, beta1=None, weight_decay=0.0,
-                         scale_parameter=False, relative_step=False, warmup_init=False)
+    opt = optimizer(model, value)
     datasets = data.load(work)
     cursor = Cursor(len(datasets["train"]), value["data_seed"])
     step, tokens_seen = 0, {"source": 0, "target": 0}
@@ -142,7 +186,7 @@ def train(work, value, resume=None, session_updates=None):
             raise ValueError("Saved execution configuration is not batch-partition compatible")
         if not signatures_compatible(state.get("execution_signatures", run["signatures"]), signatures):
             raise ValueError("Saved execution assets/data are not compatible")
-        optimizer.load_state_dict(state["optimizer"])
+        opt.load_state_dict(state["optimizer"])
         step = state["step"]
         cursor.position = state["cursor"]
         tokens_seen = state["tokens_seen"]
@@ -187,7 +231,7 @@ def train(work, value, resume=None, session_updates=None):
         if last_saved != step:
             before = time.monotonic()
             checkpoints.save(run_dir, model, tokenizer, {"step": step, "cursor": cursor.position,
-                             "tokens_seen": dict(tokens_seen), "optimizer": optimizer.state_dict(), "rng": rng_state(),
+                              "tokens_seen": dict(tokens_seen), "optimizer": opt.state_dict(), "rng": rng_state(),
                              "execution_config": value, "execution_signatures": signatures}, reason)
             last_saved = step
             log({"event": "checkpoint", "step": step, "seconds": time.monotonic() - before, "reason": reason})
@@ -197,43 +241,28 @@ def train(work, value, resume=None, session_updates=None):
             log({"event": "initialized", "step": step, "seconds": time.monotonic() - started})
             status("running")
             if not checkpoint and not stop.requested:
+                # A full restart exists before the first update/validation can OOM.
+                save("initial restart anchor")
                 before = time.monotonic()
                 result = validation_loss(model, tokenizer, datasets["validation"], value, device)
                 log({"event": "validation", "step": 0, "seconds": time.monotonic() - before, **result})
             while step < value["max_steps"] and not stop.requested:
-                optimizer.zero_grad(set_to_none=True)
                 learning_rate = lr_for_update(value, step)
-                for group in optimizer.param_groups:
+                for group in opt.param_groups:
                     group["lr"] = learning_rate
-                torch.cuda.synchronize(device)
-                before = time.monotonic()
                 count = value["microbatch_size"] * value["gradient_accumulation_steps"]
+                before = time.monotonic()
                 rows = [datasets["train"][index] for index in cursor.take(count)]
-                denominator = data.target_count(rows)
-                total_loss = 0.0
-                for offset in range(0, count, value["microbatch_size"]):
-                    batch = rows[offset:offset + value["microbatch_size"]]
-                    inputs, labels = data.batch(tokenizer, batch, device, limits=value)
-                    tokens_seen["source"] += int(inputs["attention_mask"].sum().item())
-                    tokens_seen["target"] += data.target_count(batch)
-                    with torch.autocast("cuda", dtype=torch.bfloat16):
-                        loss = modeling.loss_sum(model, inputs, labels) / denominator
-                    if not torch.isfinite(loss):
-                        raise FloatingPointError("Nonfinite SFT loss; no precision fallback")
-                    total_loss += float(loss.detach().item())
-                    loss.backward()
-                    del loss, inputs, labels
-                # Check gradients but do not add clipping on top of Adafactor's RMS clipping.
-                norm = torch.nn.utils.clip_grad_norm_(model.parameters(), float("inf"), error_if_nonfinite=True)
-                optimizer.step()
-                optimizer.zero_grad(set_to_none=True)
+                input_row_seconds = time.monotonic() - before
+                result = update(model, tokenizer, opt, rows, value, device)
+                result["update_seconds"] += input_row_seconds
+                tokens_seen["source"] += result["source_tokens"]
+                tokens_seen["target"] += result["target_tokens"]
                 step += 1
-                torch.cuda.synchronize(device)
-                log({"event": "update", "step": step, "loss": total_loss, "learning_rate": learning_rate,
-                     "gradient_norm": float(norm), "examples_seen": cursor.position,
-                     "tokens_seen": dict(tokens_seen), "update_seconds": time.monotonic() - before,
-                     "peak_allocated_bytes": torch.cuda.max_memory_allocated(device),
-                     "peak_reserved_bytes": torch.cuda.max_memory_reserved(device)})
+                log({"event": "update", "step": step, "learning_rate": learning_rate,
+                     "examples_seen": cursor.position, "tokens_seen": dict(tokens_seen),
+                     "microbatch_size": value["microbatch_size"],
+                     "gradient_accumulation_steps": value["gradient_accumulation_steps"], **result})
                 stopping = stop.requested or (session_updates is not None and step - start_step >= session_updates)
                 if checkpoint_due(value, step, stopping):
                     save("pause/final" if stopping or step == value["max_steps"] else "periodic")

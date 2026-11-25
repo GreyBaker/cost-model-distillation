@@ -12,14 +12,20 @@ from sftlib.console import output as display
 
 
 def plan(root, config_dir):
+    from sftlib.batching import candidates, PILOT_UPDATES, RESERVED_FRACTION_LIMIT
     roles = {}
     for role in ("student", "teacher"):
         value = config(role, config_dir)
         spec = asset_spec(value)
         batch = value["microbatch_size"] * value["gradient_accumulation_steps"]
         roles[role] = {"config": value, "base": {name: spec["model"][name] for name in ("repo_id", "revision")},
-                       "work": str(root / role), "effective_batch": batch,
-                       "example_presentations": value["max_steps"] * batch,
+                        "work": str(root / role), "effective_batch": batch,
+                        "example_presentations": value["max_steps"] * batch,
+                        "sft_microbatch_pilot": {
+                            "partitions_largest_first": [f"{size}x{batch // size}" for size in candidates(value)],
+                            "discarded_updates_per_candidate": PILOT_UPDATES,
+                            "reload_updates": 1, "reserved_fraction_limit": RESERVED_FRACTION_LIMIT,
+                            "selection": "largest passing full-shape train/save/reload microbatch; once per role"},
                        "download_bytes": sum(item["bytes"] for group in spec.values() for item in group["files"])}
     return {"operation": "plan only; no ML imports, downloads, CUDA calls or training", "order": ["student", "teacher"],
             "roles": roles, "automatic_time_limit": None, "export": "separate BF16 safetensors with serialization parity probes",
@@ -48,6 +54,16 @@ def main():
     train.add_argument("--resume", choices=["latest"])
     train.add_argument("--session-updates", type=int)
     train.add_argument("--accept-reconstructed-recipe", action="store_true")
+    pilot = commands.add_parser("pilot", help="ON POD: once-only largest-fit SFT microbatch pilot; discarded weights")
+    pilot.add_argument("--role", choices=["student", "teacher"], required=True)
+    for name in ("_sft_runtime", "_sft_pilot", "_train"):
+        worker = commands.add_parser(name, help=argparse.SUPPRESS)
+        worker.add_argument("--role", choices=["student", "teacher"], required=True)
+        worker.add_argument("--output", type=Path)
+        worker.add_argument("--microbatch", type=int)
+        worker.add_argument("--resume", choices=["latest"])
+        worker.add_argument("--session-updates", type=int)
+        worker.add_argument("--attempt-result", type=Path)
     export = commands.add_parser("export", help="ON THE POD: verified BF16 export of a complete role")
     export.add_argument("--role", choices=["student", "teacher"], required=True)
     export.add_argument("--allow-partial", action="store_true", help="Labeled pilot export, never a final prepared pair")
@@ -110,6 +126,18 @@ def main():
         from sftlib.sequence import run
         run(root, config_dir, reuse_student=args.reuse_student, reuse_sft=args.reuse_sft)
         return
+    if operation in ("train", "pilot"):
+        if operation == "train" and not args.resume and not args.accept_reconstructed_recipe:
+            raise ValueError("Read DECISIONS.md, then pass --accept-reconstructed-recipe")
+        configure_local_storage(root)
+        from sftlib.batching import run
+        # Supervisor and GPU workers must never contend for the same lock.
+        with RunLock(root / ".training-controller.lock"):
+            run(root, config_dir, config(args.role, config_dir),
+                resume=args.resume if operation == "train" else None,
+                session_updates=args.session_updates if operation == "train" else None,
+                pilot_only=operation == "pilot")
+        return
     if operation == "prepare" and args.role == "both":
         configure_local_storage(root)
         import subprocess
@@ -141,7 +169,35 @@ def main():
             return
         value = config(args.role, config_dir)
         work = root / args.role
-        if operation == "preflight":
+        if operation == "_sft_runtime":
+            from sftlib.batching import runtime_worker
+            if args.output is None or args.output.resolve() != work / "pilot_runtime.json":
+                raise ValueError("Explicit role-local pilot runtime output required")
+            runtime_worker(value, args.output.resolve())
+        elif operation == "_sft_pilot":
+            from sftlib.batching import pilot_worker, candidates
+            if (args.microbatch not in candidates(value) or args.output is None
+                    or not args.output.resolve().is_relative_to(work / "microbatch_pilots")):
+                raise ValueError("Explicit role-local SFT pilot candidate/output required")
+            pilot_worker(work, value, args.microbatch, args.output.resolve())
+        elif operation == "_train":
+            from sftlib.batching import OOM_EXIT_CODE, active_microbatch, partition
+            if (args.attempt_result is None
+                    or not args.attempt_result.resolve().is_relative_to(work / "attempts")):
+                raise ValueError("Explicit role-local fresh attempt report required")
+            actual = active_microbatch(work, value, read_json(work / "pilot_runtime.json"))
+            if args.microbatch != actual:
+                raise ValueError("SFT worker batch differs from saved pilot/recovery policy")
+            import torch
+            from sftlib.training import train
+            try:
+                train(work, partition(value, actual), args.resume, args.session_updates)
+            except torch.cuda.OutOfMemoryError as error:
+                atomic_json(args.attempt_result.resolve(), {
+                    "status": "cuda_oom", "operation": "train", "role": args.role,
+                    "microbatch": actual, "error": str(error)})
+                raise SystemExit(OOM_EXIT_CODE)
+        elif operation == "preflight":
             from sftlib import assets, data, modeling
             from sftlib.core import environment
             assets.verify(work, value)
@@ -151,11 +207,6 @@ def main():
             free, total = torch.cuda.mem_get_info(device)
             display({"role": args.role, "environment": environment(), "gpu": torch.cuda.get_device_name(device),
                     "free_gib": free / 1024**3, "total_gib": total / 1024**3}, "GPU preflight", args.json)
-        elif operation == "train":
-            if not args.resume and not args.accept_reconstructed_recipe:
-                raise ValueError("Read DECISIONS.md, then pass --accept-reconstructed-recipe")
-            from sftlib.training import train
-            train(work, value, args.resume, args.session_updates)
         elif operation == "export":
             from sftlib.inference import export
             export(work, value, args.allow_partial)
