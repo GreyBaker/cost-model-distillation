@@ -14,9 +14,12 @@ class CudaOOM(RuntimeError):
         super().__init__(f"CUDA OOM in {report['operation']} for {report['cell']}")
 
 
-def identity(root):
-    return {"binding_sha256": sha256(root / "binding.json"),
-            "pilot_sha256": sha256(root / "pilot.json")}
+def identity(root, evaluation=False):
+    value = {"binding_sha256": sha256(root / "binding.json"),
+             "pilot_sha256": sha256(root / "pilot.json")}
+    if evaluation and (root / "evaluation_pilot.json").exists():
+        value["evaluation_pilot_sha256"] = sha256(root / "evaluation_pilot.json")
+    return value
 
 
 def read_batch(root, path, initial, training=False):
@@ -24,7 +27,7 @@ def read_batch(root, path, initial, training=False):
         return initial, []
     saved = read_json(path)
     value = saved["microbatch"]
-    if (saved["identity"] != identity(root) or type(value) is not int or not 1 <= value <= initial
+    if (saved["identity"] != identity(root, evaluation=not training) or type(value) is not int or not 1 <= value <= initial
             or (training and 32 % value)):
         raise ValueError("Foreign/invalid saved batching recovery state")
     return value, saved["history"]
@@ -39,8 +42,16 @@ def evaluation_path(root, item):
     return owner / "evaluation_batching.json"
 
 
+def evaluation_initial(root, bound, selected):
+    if (root / "evaluation_pilot.json").exists():
+        from .evalpilot import saved
+        return saved(root, bound, selected)["batch_size"]
+    # Legacy identity/audit compatibility only. New workers require calibration.
+    return min(selected["microbatch"], bound["settings"]["evaluation_batch_cap"])
+
+
 def evaluation_microbatch(root, bound, item, selected):
-    initial = min(selected["microbatch"], bound["settings"]["evaluation_batch_cap"])
+    initial = evaluation_initial(root, bound, selected)
     return read_batch(root, evaluation_path(root, item), initial)[0]
 
 
@@ -52,7 +63,8 @@ def lower(root, path, initial, failed, *, training=False, **context):
         raise RuntimeError("CUDA OOM at microbatch 1; no further automatic reduction is possible")
     smaller = max(1, current // 2)
     event = {"from_microbatch": current, "to_microbatch": smaller, "unix_time": time.time(), **context}
-    atomic_json(path, {"identity": identity(root), "microbatch": smaller, "history": [*history, event]})
+    atomic_json(path, {"identity": identity(root, evaluation=not training),
+                       "microbatch": smaller, "history": [*history, event]})
     print(f"CUDA OOM: retry in a fresh process at microbatch {smaller} (was {current}).", flush=True)
     return smaller
 

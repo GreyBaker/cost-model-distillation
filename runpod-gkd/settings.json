@@ -8,5 +8,6 @@
   "pilot_updates": 3,
   "allocator_fraction": 0.9,
   "pilot_reserved_fraction_limit": 0.85,
-  "evaluation_batch_cap": 16
+  "evaluation_batch_cap": 11332,
+  "evaluation_batch_safety_fraction": 0.9
 }

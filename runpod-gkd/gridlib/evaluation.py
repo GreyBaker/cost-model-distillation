@@ -42,10 +42,13 @@ def source(root, bound, item):
 def identity(root, bound, item, selected):
     from .recovery import evaluation_microbatch
     directory = source(root, bound, item)
-    return {"source_complete_sha256": sha256(directory / "COMPLETE.json"),
+    result = {"source_complete_sha256": sha256(directory / "COMPLETE.json"),
             "binding_sha256": sha256(root / "binding.json"),
             "protocol": PROTOCOL, "batch_size": evaluation_microbatch(root, bound, item, selected),
-            "precision": "bfloat16", "split": "validation", "n": VALIDATION_N}
+             "precision": "bfloat16", "split": "validation", "n": VALIDATION_N}
+    if (root / "evaluation_pilot.json").exists():
+        result["evaluation_pilot_sha256"] = sha256(root / "evaluation_pilot.json")
+    return result
 
 
 def evaluate(root, bound, item, selected, output):
@@ -53,6 +56,8 @@ def evaluate(root, bound, item, selected, output):
     expected = identity(root, bound, item, selected)
     if output.exists():
         return verify(output, expected)
+    if not (root / "evaluation_pilot.json").exists():
+        raise ValueError("Run the once-only evaluation batch pilot before new evaluations")
     import torch
     from rouge_score import rouge_scorer
     from sftlib import data, modeling

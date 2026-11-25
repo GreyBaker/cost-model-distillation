@@ -70,6 +70,10 @@ def estimate(root, selected, settings):
     return {"basis": "Measured joint-fit pilot on the actual GPU plus full common-baseline validation",
             "pilot_sha256": sha256(root / "pilot.json"), "cells": rows,
             "pilot_microbatch": selected["microbatch"], "active_training_microbatch": active,
+            "evaluation_pilot_batch": (read_json(root / "evaluation_pilot.json")["batch_size"]
+                                       if (root / "evaluation_pilot.json").exists() else None),
+            "evaluation_pilot_sha256": (sha256(root / "evaluation_pilot.json")
+                                        if (root / "evaluation_pilot.json").exists() else None),
             "forecast_stale_after_oom": active != selected["microbatch"],
             "training_hours": sum(x["estimated_training_seconds"] for x in rows) / 3600,
             "evaluation_hours": sum(x["estimated_evaluation_seconds"] for x in rows) / 3600,
@@ -152,14 +156,22 @@ def summary(root):
     finished_logs = {x["log"] for x in stages}
     unmeasured = [x for x in records(root / "stage_starts.jsonl") if x["log"] not in finished_logs]
     result = {"rows": rows, "baseline": baseline,
+               "evaluation_pilot": (read_json(root / "evaluation_pilot.json")
+                                    if (root / "evaluation_pilot.json").exists() else None),
+               "evaluation_pilot_provenance": [read_json(path) for path in
+                                               sorted((root / "evaluation_pilot_provenance").glob("*.json"))],
+               "evaluation_pilot_wall_seconds": sum(x["seconds"] for x in stages
+                                                     if x["operation"] == "evaluation_pilot"),
               "complete_cells": sum(x["status"] == "complete" for x in rows),
               "unmeasured_interrupted_stages": unmeasured,
               "shared_stage_wall_seconds": sum(x["seconds"] for x in stages if x["cell"] == "shared"),
               "oom_training_recovery": read_json(root / "training_batching.json")
                                       if (root / "training_batching.json").exists() else None,
-              "time_accounting": "training_seconds = committed synchronized update time including generation/scoring/backward. "
-                                 "Stage wall includes initialization/checkpoint/evaluation and recorded failed attempts. "
-                                 "Shared pilot/baseline/controller overhead is separate; killed controllers may leave unmeasured stages."}
+               "time_accounting": "training_seconds = committed synchronized update time including generation/scoring/backward. "
+                                  "Stage wall includes initialization/checkpoint/evaluation and recorded failed attempts. "
+                                  "Shared pilot/baseline/controller overhead is separate; evaluation_pilot_wall_seconds "
+                                  "is a component of shared_stage_wall_seconds, not an additional cost. "
+                                  "Killed controllers may leave unmeasured stages."}
     atomic_json(root / "summary.json", result)
     buffer = io.StringIO(newline="")
     writer = csv.DictWriter(buffer, fieldnames=list(rows[0]))

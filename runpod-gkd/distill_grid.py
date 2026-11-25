@@ -20,13 +20,13 @@ def main():
     commands = parser.add_subparsers(dest="command")
     commands.add_parser("plan", help="Read-only grid/count/runtime scenarios; no ML imports")
     commands.add_parser("bind", help="After SFT only: verify/freeze completed pair (hashes; no GPU/model load)")
-    commands.add_parser("pilot", help="ON POD: once-only joint-fit pilot, save/reload, then full common baseline")
+    commands.add_parser("pilot", help="ON POD: once-only training fit and evaluation batch pilots, then full baseline")
     commands.add_parser("estimate", help="Read-only measured full-grid estimate from saved pilot/baseline")
     run = commands.add_parser("run", help="Print estimate; execute only with --accept-estimate")
     run.add_argument("--accept-estimate", action="store_true")
     commands.add_parser("summary", help="Write JSON/CSV/Markdown summary without ML imports")
     commands.add_parser("audit", help="Offline final-grid hashes/counts/coverage audit; no ML imports")
-    for name in ("_train", "_evaluate", "_pilot", "_runtime"):
+    for name in ("_train", "_evaluate", "_pilot", "_evaluation_pilot", "_runtime"):
         worker = commands.add_parser(name, help=argparse.SUPPRESS)
         worker.add_argument("--cell")
         worker.add_argument("--microbatch", type=int)
@@ -58,7 +58,7 @@ def main():
         display(estimate(root, saved_pilot(root), settings), "Grid runtime estimate", args.json)
         return
     lock_name = ".worker.lock" if operation.startswith("_") else ".controller.lock"
-    if operation in ("pilot", "run", "_runtime", "_pilot", "_train", "_evaluate"):
+    if operation in ("pilot", "run", "_runtime", "_pilot", "_evaluation_pilot", "_train", "_evaluate"):
         from sftlib.core import configure_local_storage
         configure_local_storage(root)
     with RunLock(root / lock_name):
@@ -95,6 +95,15 @@ def main():
             if args.microbatch not in settings["pilot_microbatches"] or args.online is None or args.output is None:
                 raise ValueError("Explicit pilot worker arguments required")
             pilot_worker(root, bound, args.microbatch, bool(args.online), args.output.resolve())
+        elif operation == "_evaluation_pilot":
+            from gridlib.controller import saved_pilot
+            from gridlib.evalpilot import worker
+            if args.microbatch is None or args.output is None:
+                raise ValueError("Explicit evaluation-pilot batch and output required")
+            output = args.output.resolve()
+            if not output.is_relative_to(root / "evaluation_pilots"):
+                raise ValueError("Evaluation-pilot results must stay in this grid's evaluation_pilots directory")
+            worker(root, bound, saved_pilot(root), args.microbatch, output)
         elif operation in ("_train", "_evaluate"):
             from gridlib.controller import saved_pilot
             from gridlib.recovery import (OOM_EXIT_CODE, evaluation_microbatch, training_microbatch)

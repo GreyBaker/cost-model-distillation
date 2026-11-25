@@ -29,7 +29,8 @@ def settings(path=None):
     expected = {"seed", "data_seed", "effective_batch_size", "learning_rate",
                 "save_every_updates", "pilot_microbatches", "pilot_updates",
                 "allocator_fraction", "pilot_reserved_fraction_limit", "evaluation_batch_cap"}
-    if set(value) != expected:
+    optional = {"evaluation_batch_safety_fraction"}
+    if not expected <= set(value) or set(value) - expected - optional:
         raise ValueError("Unknown/missing settings fields")
     for key in ("seed", "data_seed", "effective_batch_size", "save_every_updates",
                 "pilot_updates", "evaluation_batch_cap"):
@@ -43,6 +44,9 @@ def settings(path=None):
             raise ValueError(f"Invalid finite positive setting: {key}")
     if not value["pilot_reserved_fraction_limit"] < value["allocator_fraction"] <= 1:
         raise ValueError("Require reserved-memory headroom below allocator fraction <= 1")
+    safety = value.get("evaluation_batch_safety_fraction", .9)
+    if isinstance(safety, bool) or not isinstance(safety, (int, float)) or not math.isfinite(safety) or not 0 < safety < 1:
+        raise ValueError("Evaluation batch safety fraction must be finite and strictly between 0 and 1")
     sizes = value["pilot_microbatches"]
     if (not isinstance(sizes, list) or not sizes or sizes != sorted(set(sizes))
             or any(type(x) is not int or x < 1 or 32 % x for x in sizes)):
@@ -121,6 +125,8 @@ def plan():
                        for key in ("budget_points", "points", "examples", "on_policy_examples",
                                    "off_policy_examples", "updates", "unspent_points")},
             "validation_generations_including_baseline": VALIDATION_N * (len(grid) + 1),
+            "evaluation_batch_policy": "Once-only independent student-inference stress pilot; integer fit search "
+                                       "to evaluation_batch_cap, then tested safety fraction; shared by baseline/all cells",
             "runtime_scenarios": [
                 {"assumed_points_per_second": rate,
                  "training_hours": sum(row["points"] for row in grid) / rate / 3600}

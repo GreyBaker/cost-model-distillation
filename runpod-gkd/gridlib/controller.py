@@ -14,7 +14,8 @@ from .policy import ROOT, cells
 from .shared import atomic_json, checkpoints, read_json, sha256
 from .engine import append, check_state
 from .recovery import (CudaOOM, OOM_EXIT_CODE, evaluation_microbatch, evaluation_path,
-                       lower, train_with_recovery)
+                        evaluation_initial, lower, train_with_recovery)
+from . import evalpilot
 from sftlib.console import message, output as display, run_logged
 
 
@@ -83,7 +84,7 @@ def ensure_evaluation(root, bound, item, selected, runner):
             if item is not None:
                 from .recovery import checkpoint_for_retry
                 checkpoint_for_retry(root, item)
-            initial = min(selected["microbatch"], bound["settings"]["evaluation_batch_cap"])
+            initial = evaluation_initial(root, bound, selected)
             lower(root, evaluation_path(root, item), initial,
                   evaluation_microbatch(root, bound, item, selected),
                   cell=item["id"] if item else "baseline", failure=error.report)
@@ -99,11 +100,17 @@ def evaluation_attempt(root, bound, item, selected, runner):
         evaluation.verify(output, expected)
         return True
     output = owner / "evaluation"
+    # A worker may publish COMPLETE then die before latest_evaluation.json.
+    # Verify ALL completed candidates before repairing: foreign/corrupt retries
+    # fail closed even if another valid completion exists. Partial dirs are kept.
+    completed = [path for path in [output, *sorted(owner.glob("evaluation-retry-*"))]
+                 if (path / "COMPLETE.json").exists()]
+    for candidate in completed:
+        evaluation.verify(candidate, expected)
+    if completed:
+        atomic_json(pointer, {"path": str(completed[0])})
+        return True
     if output.exists():
-        if (output / "COMPLETE.json").exists():
-            evaluation.verify(output, expected)
-            atomic_json(pointer, {"path": str(output)})
-            return True
         output = owner / ("evaluation-retry-" + uuid.uuid4().hex)
     return runner.call("evaluate", item["id"] if item else "shared",
                        "--cell", item["id"] if item else "baseline", "--output", output,
@@ -173,12 +180,15 @@ def pilot(root, bound, settings_path):
             selected = reporting.select_pilot(results, bound["settings"]["pilot_microbatches"])
             atomic_json(root / "pilot.json", {"binding_sha256": request["binding_sha256"],
                         "selected": selected, "result_files": files})
+        if not evalpilot.ensure(root, bound, selected, runner):
+            return
         if not ensure_evaluation(root, bound, None, selected, runner):
             return
         forecast = reporting.estimate(root, selected, bound["settings"])
         atomic_json(root / "estimate.json", forecast)
         atomic_json(root / "status.json", {"status": "pilot_ready",
-                                         "microbatch": selected["microbatch"]})
+                                          "microbatch": selected["microbatch"],
+                                          "evaluation_batch_size": evaluation_initial(root, bound, selected)})
         display(forecast, "Grid runtime estimate")
 
 
@@ -195,6 +205,8 @@ def run(root, bound, settings_path):
             return
         if read_json(root / "runtime.json") != selected["runtime"]:
             raise ValueError("GPU/software differs from the once-only pilot; use a new grid directory")
+        if not evalpilot.ensure(root, bound, selected, runner):
+            return
         if not ensure_evaluation(root, bound, None, selected, runner):
             return
         for index, item in enumerate(cells(), 1):
