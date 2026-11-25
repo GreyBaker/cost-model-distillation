@@ -9,6 +9,7 @@ import time
 from .core import atomic_json
 
 PARTITION = {"microbatch_size", "gradient_accumulation_steps"}
+RETIRED_MONITOR = {"rouge_every_steps", "rouge_examples", "review_step"}
 
 
 def digest(value):
@@ -23,10 +24,13 @@ def effective_batch(value):
 
 
 def config_compatible(saved, current):
+    # Removing diagnostics does not change optimizer updates or their lineage.
+    # Keep historical configs/checkpoint metadata intact and record migration.
+    ignored = PARTITION | (RETIRED_MONITOR if saved.get("role") == current.get("role") == "teacher" else set())
     return (effective_batch(saved) is not None
             and effective_batch(saved) == effective_batch(current)
-            and {k: v for k, v in saved.items() if k not in PARTITION}
-            == {k: v for k, v in current.items() if k not in PARTITION})
+            and {k: v for k, v in saved.items() if k not in ignored}
+            == {k: v for k, v in current.items() if k not in ignored})
 
 
 def signatures_compatible(saved, current):
@@ -43,5 +47,5 @@ def record_migration(directory, saved, current, checkpoint=None):
     path = Path(directory) / (digest(event) + ".json")
     if not path.exists():
         atomic_json(path, {**event, "unix_time": time.time(),
-                          "note": "Batch partition/code migration; effective examples and semantic recipe preserved. "
+                          "note": "Batch partition/code/retired-monitor migration; effective examples and semantic recipe preserved. "
                                   "Floating point, dropout and generated trajectories need not be bitwise identical."})

@@ -10,7 +10,7 @@ import sys
 import time
 import uuid
 
-from . import assets, checkpoints, data, inference, monitoring
+from . import assets, checkpoints, data, inference
 from .core import ROOT, SPEC, RunLock, atomic_json, check_teacher_work, code_signature, config, read_json, sha256
 from .resume import config_compatible, record_migration
 from .console import message, run_logged
@@ -28,8 +28,7 @@ def training_complete(work, value):
     run = read_json(run_dir / "run.json")
     checkpoint = checkpoints.resolve(run_dir)
     marker = checkpoints.verify(checkpoint, run["run_id"])
-    return (config_compatible(run["config"], value) and marker["step"] == value["max_steps"]
-            and monitoring.finished(run_dir, value, marker["step"]))
+    return config_compatible(run["config"], value) and marker["step"] == value["max_steps"]
 
 
 def verified_role(root, config_dir, role):

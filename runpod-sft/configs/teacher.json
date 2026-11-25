@@ -22,9 +22,6 @@
   "keep_checkpoints": 2,
   "eval_every_steps": 500,
   "eval_examples": 128,
-  "rouge_every_steps": 500,
-  "rouge_examples": 512,
-  "review_step": 1000,
   "evaluation_batch_size": 4,
   "gpu_memory_warning_gib": 75
 }

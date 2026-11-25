@@ -23,7 +23,7 @@ KEYS = {"role", "run_name", "max_steps", "seed", "data_seed", "prefix", "max_sou
         "warmup_steps", "dropout", "gradient_checkpointing", "save_every_steps", "keep_checkpoints",
         "eval_every_steps", "eval_examples", "evaluation_batch_size", "gpu_memory_warning_gib"}
 TEACHER_KEYS = {"recipe", "scale_parameter", "cooldown_start_step", "loss_normalizing_factor",
-                "z_loss", "rouge_every_steps", "rouge_examples", "review_step"}
+                "z_loss"}
 
 
 def read_json(path):
@@ -160,22 +160,17 @@ def config(role, directory=CONFIGS):
     if value["learning_rate"] <= 0 or value["gpu_memory_warning_gib"] <= 0 or not 0 <= value["dropout"] < 1:
         raise ValueError("Invalid LR/VRAM advisory/dropout")
     if value["keep_checkpoints"] != 2 or value["warmup_steps"] > value["max_steps"]:
-        raise ValueError("Retain two recent checkpoints (plus pinned best); warmup must fit budget")
+        raise ValueError("Retain two recent checkpoints (preserving historical pins); warmup must fit budget")
     if type(value["gradient_checkpointing"]) is not bool or not isinstance(value["prefix"], str):
         raise ValueError("Invalid gradient checkpointing/prefix")
     if role == "teacher":
         if value["recipe"] != "t5x_xsum_xl_adapted_v1" or value["scale_parameter"] is not True:
             raise ValueError("Teacher requires the declared parameter-scaled researched recipe")
-        for key in ("cooldown_start_step", "loss_normalizing_factor", "rouge_every_steps",
-                    "rouge_examples", "review_step"):
+        for key in ("cooldown_start_step", "loss_normalizing_factor"):
             if type(value[key]) is not int or value[key] < 1:
                 raise ValueError(f"{key} must be a positive integer")
-        if (not value["warmup_steps"] <= value["cooldown_start_step"] < value["max_steps"]
-                or value["rouge_examples"] > 11332 or value["review_step"] >= value["max_steps"]
-                or value["review_step"] % value["rouge_every_steps"]
-                or value["rouge_every_steps"] % value["save_every_steps"]
-                or value["max_steps"] % value["rouge_every_steps"]):
-            raise ValueError("Invalid teacher cooldown/ROUGE/review/checkpoint boundaries")
+        if not value["warmup_steps"] <= value["cooldown_start_step"] < value["max_steps"]:
+            raise ValueError("Invalid teacher cooldown boundaries")
         if (type(value["z_loss"]) not in (int, float) or not math.isfinite(value["z_loss"])
                 or value["z_loss"] < 0):
             raise ValueError("Invalid teacher z-loss coefficient")

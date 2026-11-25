@@ -1,4 +1,4 @@
-"""Largest-fit SFT microbatch pilots and checkpoint-only CUDA-OOM recovery."""
+"""Fastest-update SFT partition search and checkpoint-only CUDA-OOM recovery."""
 from __future__ import annotations
 
 import json
@@ -9,7 +9,7 @@ import sys
 import time
 import uuid
 
-from . import assets, checkpoints, data, monitoring
+from . import assets, checkpoints, data
 from .core import ROOT, atomic_json, check_teacher_work, code_signature, read_json, sha256
 from .resume import PARTITION, config_compatible, effective_batch
 from .console import message, run_logged
@@ -17,6 +17,7 @@ from .console import message, run_logged
 OOM_EXIT_CODE = 86
 PILOT_UPDATES = 3
 RESERVED_FRACTION_LIMIT = .9
+SELECTION_POLICY = "min_mean_warmed_update_seconds_v1"
 
 
 def candidates(value):
@@ -35,10 +36,12 @@ def partition(value, microbatch):
 
 def context(work, value, runtime):
     return {"recipe": {k: v for k, v in value.items() if k not in PARTITION},
+            "selection_policy": SELECTION_POLICY,
             "effective_batch": effective_batch(value), "runtime": runtime,
             "assets_sha256": sha256(work / "assets/manifest.json"),
             "prepared_sha256": sha256(work / "prepared/manifest.json"),
             "candidates": candidates(value), "pilot_updates": PILOT_UPDATES,
+            "warmup_updates": 1, "timed_updates": PILOT_UPDATES - 1,
             "reserved_fraction_limit": RESERVED_FRACTION_LIMIT}
 
 
@@ -89,8 +92,19 @@ def verify_trial(result, expected, size):
     return result["status"] == "pass"
 
 
+def warmed_seconds(result):
+    """Use only synchronized training updates after warmup, never IO/validation."""
+    rows = result["updates"][1:]
+    return sum(row["update_seconds"] for row in rows) / len(rows)
+
+
+def ranking(trials):
+    return sorted((trial for trial in trials if trial["status"] == "pass"),
+                  key=lambda trial: (warmed_seconds(trial), -trial["microbatch"]))
+
+
 def saved_pilot(work, value, runtime):
-    result = read_json(work / "microbatch_pilot.json")
+    result = read_json(work / "throughput_pilot.json")
     expected = context(work, value, runtime)
     if result["context"] != expected:
         raise ValueError("SFT pilot hardware/software/inputs/recipe changed; use a new work directory")
@@ -99,71 +113,90 @@ def saved_pilot(work, value, runtime):
     if type(selected) is not int or selected not in sizes:
         raise ValueError("Invalid saved SFT microbatch")
     files = result["result_files"]
-    if len(files) != sizes.index(selected) + 1:
-        raise ValueError("SFT pilot lacks failed larger-candidate evidence")
+    if len(files) != len(sizes):
+        raise ValueError("SFT throughput pilot lacks measurements for every partition")
+    trials = []
     for size, entry in zip(sizes, files):
         path = Path(entry["path"])
         if sha256(path) != entry["sha256"]:
             raise ValueError("SFT pilot candidate hash changed")
         trial = read_json(path)
-        passed = verify_trial(trial, expected, size)
+        verify_trial(trial, expected, size)
         if trial.get("anchor") != result["anchor"]:
             raise ValueError("SFT pilot candidates mixed different initialization checkpoints")
-        if passed != (size == selected):
-            raise ValueError("SFT pilot did not select the largest passing candidate")
+        trials.append(trial)
+    ordered = ranking(trials)
+    if not ordered or ordered[0]["microbatch"] != selected:
+        raise ValueError("SFT pilot did not select the fastest passing partition")
+    if (result.get("mean_warmed_update_seconds") != warmed_seconds(ordered[0])
+            or result.get("accumulation") != effective_batch(value) // selected):
+        raise ValueError("SFT throughput selection timing/accumulation disagrees with candidate evidence")
     return result
 
 
 def ensure_pilot(work, value, runtime, launch):
-    if (work / "microbatch_pilot.json").exists():
+    if (work / "throughput_pilot.json").exists():
         result = saved_pilot(work, value, runtime)
         atomic_json(work / "pilot_reuse" / f"{uuid.uuid4().hex}.json", {
             "code": code_signature(), "unix_time": time.time(),
             "pilot_code": result.get("code", {}),
-            "note": "Source hashes are provenance only; the once-only fit pilot is reused."})
+            "note": "Source hashes are provenance only; the once-only throughput pilot is reused."})
         if result.get("code") != code_signature():
-            message("WARNING: SFT fit pilot predates current source; reused without a code-hash gate.")
+            message("WARNING: SFT throughput pilot predates current source; reused without a code-hash gate.")
         return result
     expected = context(work, value, runtime)
-    request_path = work / "microbatch_pilot_request.json"
+    request_path = work / "throughput_pilot_request.json"
     if request_path.exists():
         request = read_json(request_path)
         if request["context"] != expected:
             raise ValueError("Incomplete SFT pilot request changed; use a new work directory")
     else:
-        request = {"context": expected, "anchor": source_anchor(work, value), "code": code_signature()}
+        prior = {name: sha256(work / name)
+                 for name in ("microbatch_pilot.json", "training_batching.json")
+                 if (work / name).is_file()}
+        request = {"context": expected, "anchor": source_anchor(work, value), "code": code_signature(),
+                   "prior_largest_fit_artifacts": prior}
         atomic_json(request_path, request)
-    files = []
+    files, trials = [], []
     for size in candidates(value):
-        output = work / "microbatch_pilots" / f"mb-{size:05d}.json"
+        output = work / "throughput_pilots" / f"mb-{size:05d}.json"
         if not output.exists() and not launch("_sft_pilot", "--microbatch", size, "--output", output):
             return None
         trial = read_json(output)
-        passed = verify_trial(trial, expected, size)
+        verify_trial(trial, expected, size)
         if trial.get("anchor") != request["anchor"]:
             raise ValueError("SFT pilot source checkpoint changed between candidates")
         if trial.get("code") != code_signature():
             message("WARNING: reusing an SFT pilot candidate measured under different source code.")
         files.append({"path": str(output), "sha256": sha256(output)})
-        if passed:
-            result = {"context": expected, "microbatch": size,
-                      "accumulation": effective_batch(value) // size, "anchor": request["anchor"],
-                      "result_files": files, "code": code_signature(),
-                      "selection": "largest passing divisor of effective batch, including full save/reload stress"}
-            atomic_json(work / "microbatch_pilot.json", result)
-            saved_pilot(work, value, runtime)
-            message(f"{value['role'].title()} SFT pilot selected {size} × {result['accumulation']}.")
-            return result
-    raise RuntimeError(f"{value['role']} SFT cannot fit even microbatch 1 with reserved-memory headroom")
+        trials.append(trial)
+        if trial["status"] == "pass":
+            message(f"{value['role'].title()} SFT {size} × {effective_batch(value) // size}: "
+                    f"{warmed_seconds(trial):.3f}s/warmed update.")
+    ordered = ranking(trials)
+    if not ordered:
+        raise RuntimeError(f"{value['role']} SFT has no passing partition, including microbatch 1, with memory headroom")
+    best = ordered[0]
+    size = best["microbatch"]
+    result = {"context": expected, "microbatch": size,
+              "accumulation": effective_batch(value) // size, "anchor": request["anchor"],
+              "result_files": files, "code": code_signature(),
+              "mean_warmed_update_seconds": warmed_seconds(best),
+              "selection": "minimum mean warmed update_seconds across all passing partitions; exact ties prefer larger microbatch"}
+    atomic_json(work / "throughput_pilot.json", result)
+    saved_pilot(work, value, runtime)
+    message(f"{value['role'].title()} SFT pilot selected {size} × {result['accumulation']} "
+            f"at {warmed_seconds(best):.3f}s/warmed update.")
+    return result
 
 
 def active_microbatch(work, value, runtime):
     initial = saved_pilot(work, value, runtime)["microbatch"]
-    path = work / "training_batching.json"
+    path = work / "throughput_batching.json"
     if not path.exists():
         return initial
     result = read_json(path)
-    if (result.get("pilot_sha256") != sha256(work / "microbatch_pilot.json")
+    if (result.get("pilot_sha256") != sha256(work / "throughput_pilot.json")
             or type(result.get("microbatch")) is not int
             or result["microbatch"] not in candidates(value)
             or result["microbatch"] > initial):
@@ -238,7 +271,7 @@ def run(root, config_dir, value, *, resume=None, session_updates=None, pilot_onl
         raise ValueError("No SFT run to resume")
     checkpoint = latest(work, value) if run_exists else None
     start = read_json(checkpoint / "COMPLETE.json")["step"] if checkpoint else 0
-    if start == value["max_steps"] and monitoring.finished(checkpoint.parent.parent, value, start):
+    if start == value["max_steps"]:
         message(f"{value['role'].title()} SFT already complete; no pilot or training launched.")
         return
     if session_updates is not None and (type(session_updates) is not int or session_updates < 1):
@@ -262,7 +295,7 @@ def run(root, config_dir, value, *, resume=None, session_updates=None, pilot_onl
         while not stop.requested:
             checkpoint = latest(work, value)
             step = read_json(checkpoint / "COMPLETE.json")["step"] if checkpoint else 0
-            if step >= target and (checkpoint is None or monitoring.finished(checkpoint.parent.parent, value, step)):
+            if step >= target:
                 return
             size = active_microbatch(work, value, runtime)
             extra = ["--microbatch", size]
@@ -283,13 +316,13 @@ def run(root, config_dir, value, *, resume=None, session_updates=None, pilot_onl
                 smaller = [candidate for candidate in candidates(value) if candidate < size]
                 if not smaller:
                     raise RuntimeError("SFT CUDA OOM at microbatch 1; no further reduction")
-                path = work / "training_batching.json"
+                path = work / "throughput_batching.json"
                 history = read_json(path)["history"] if path.exists() else []
                 event = {"from_microbatch": size, "to_microbatch": smaller[0],
                          "checkpoint": str(checkpoint),
                          "step": read_json(checkpoint / "COMPLETE.json")["step"],
                          "unix_time": time.time(), "failure": error.report}
-                atomic_json(path, {"pilot_sha256": sha256(work / "microbatch_pilot.json"),
+                atomic_json(path, {"pilot_sha256": sha256(work / "throughput_pilot.json"),
                                    "microbatch": smaller[0], "history": [*history, event]})
                 message(f"SFT OOM: restart {value['role']} from update {event['step']:,} "
                         f"at {smaller[0]} × {effective_batch(value) // smaller[0]}.")
@@ -307,7 +340,7 @@ def pilot_worker(work, value, microbatch, output):
     import torch
     from . import modeling, training
     started = time.monotonic()
-    request = read_json(work / "microbatch_pilot_request.json")
+    request = read_json(work / "throughput_pilot_request.json")
     value = partition(value, microbatch)
     if output.exists():
         raise FileExistsError("Never overwrite a completed SFT pilot candidate")
@@ -388,14 +421,10 @@ def pilot_worker(work, value, microbatch, output):
         before = time.monotonic()
         validation = training.validation_loss(model, tokenizer, datasets["validation"], value, device)
         validation_seconds = time.monotonic() - before
-        greedy_monitor = None
-        if value.get("rouge_every_steps"):
-            greedy_monitor = monitoring.measure(model, tokenizer, datasets["validation"], value, device)
         peak = max(peak, torch.cuda.max_memory_reserved(device))
         result = {"status": "pass" if peak <= runtime["total_memory"] * RESERVED_FRACTION_LIMIT else "headroom",
                   "peak_reserved_bytes": peak, "updates": records, "resumed_update": resumed,
                   "validation": validation, "save_reload_verified": True,
-                  "greedy_monitor": greedy_monitor,
                   "checkpoint_seconds": checkpoint_seconds, "validation_seconds": validation_seconds,
                   "initialization_seconds": initialization_seconds,
                   "pilot_checkpoint": str(saved),

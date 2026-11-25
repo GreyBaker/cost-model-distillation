@@ -47,7 +47,7 @@ def verify(path, run_id):
 
 
 def best_checkpoint(run_dir):
-    """Validate the pinned pointer and its immutable monitoring evidence."""
+    """Protect a historical best pin; new runs do not monitor or create pins."""
     choices = completed(run_dir)
     best_path = run_dir / "best_checkpoint.json"
     if not best_path.exists():

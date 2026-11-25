@@ -24,13 +24,11 @@ def plan(root, config_dir):
                         "example_presentations": value["max_steps"] * batch,
                         "sft_microbatch_pilot": {
                             "partitions_largest_first": [f"{size}x{batch // size}" for size in candidates(value)],
-                            "discarded_updates_per_candidate": PILOT_UPDATES,
+                             "discarded_updates_per_candidate": PILOT_UPDATES,
+                             "warmup_updates": 1, "timed_updates": PILOT_UPDATES - 1,
                             "reload_updates": 1, "reserved_fraction_limit": RESERVED_FRACTION_LIMIT,
-                            "selection": "largest passing full-shape train/save/reload microbatch; once per role"},
-                        "greedy_monitoring": ({"every_steps": value["rouge_every_steps"],
-                            "examples": value["rouge_examples"], "advisory_review_step": value["review_step"],
-                            "retention": "latest two + pinned subset-best; final 8K exported for grid"}
-                            if role == "teacher" else None),
+                             "selection": "minimum mean warmed update_seconds over ALL fitting partitions; once per role"},
+                         "periodic_greedy_monitor": False,
                        "download_bytes": sum(item["bytes"] for group in spec.values() for item in group["files"])}
     return {"operation": "plan only; no ML imports, downloads, CUDA calls or training", "order": ["student", "teacher"],
             "roles": roles, "automatic_time_limit": None, "export": "separate BF16 safetensors with serialization parity probes",
@@ -61,7 +59,7 @@ def main():
     train.add_argument("--resume", choices=["latest"])
     train.add_argument("--session-updates", type=int)
     train.add_argument("--accept-reconstructed-recipe", action="store_true")
-    pilot = commands.add_parser("pilot", help="ON POD: once-only largest-fit SFT microbatch pilot; discarded weights")
+    pilot = commands.add_parser("pilot", help="ON POD: search SFT partitions for fastest warmed update; discarded weights")
     pilot.add_argument("--role", choices=["student", "teacher"], required=True)
     for name in ("_sft_runtime", "_sft_pilot", "_train"):
         worker = commands.add_parser(name, help=argparse.SUPPRESS)
@@ -185,7 +183,7 @@ def main():
         elif operation == "_sft_pilot":
             from sftlib.batching import pilot_worker, candidates
             if (args.microbatch not in candidates(value) or args.output is None
-                    or not args.output.resolve().is_relative_to(work / "microbatch_pilots")):
+                    or not args.output.resolve().is_relative_to(work / "throughput_pilots")):
                 raise ValueError("Explicit role-local SFT pilot candidate/output required")
             pilot_worker(work, value, args.microbatch, args.output.resolve())
         elif operation == "_train":

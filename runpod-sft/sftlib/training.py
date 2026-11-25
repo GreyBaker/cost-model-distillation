@@ -6,7 +6,7 @@ import signal
 import time
 import uuid
 
-from . import assets, checkpoints, data, modeling, monitoring
+from . import assets, checkpoints, data, modeling
 from .core import (Cursor, atomic_json, checkpoint_due, code_signature, environment,
                    lr_for_update, read_json, recipe_evidence, sha256)
 from .resume import config_compatible, record_migration, signatures_compatible
@@ -161,7 +161,7 @@ def train(work, value, resume=None, session_updates=None):
         record_migration(run_dir / "migrations",
                          {"config": run["config"], "signatures": run["signatures"]},
                          {"config": value, "signatures": signatures}, checkpoint)
-        if marker["step"] >= value["max_steps"] and monitoring.finished(run_dir, value, marker["step"]):
+        if marker["step"] >= value["max_steps"]:
             print("This role already completed its full update budget; no training run.")
             return
     else:
@@ -221,12 +221,6 @@ def train(work, value, resume=None, session_updates=None):
         elif record["event"] == "validation":
             message(f"{value['role'].title()} validation at update {record['step']:,}: "
                      f"CE {record['validation_loss']:.4f} ({duration(record['seconds'])}).")
-        elif record["event"] == "greedy_monitor":
-            message(f"Teacher greedy monitor at update {record['step']:,}: "
-                    f"R2 {record['scores']['rouge2']:.3f}, n={record['n']} "
-                    f"({duration(record['seconds'])}).")
-            if record["step"] == value.get("review_step"):
-                message(f"Teacher 1K advisory review saved: {run_dir / 'teacher_review.json'}")
         elif record["event"] == "initialized":
             message(f"{value['role'].title()} SFT ready at update {step:,}; "
                     f"microbatch {value['microbatch_size']} × accumulation "
@@ -249,20 +243,6 @@ def train(work, value, resume=None, session_updates=None):
             last_saved = step
             log({"event": "checkpoint", "step": step, "seconds": time.monotonic() - before, "reason": reason})
 
-    def monitor():
-        if not monitoring.due(value, step):
-            return
-        saved_rng = rng_state()
-        try:
-            result = monitoring.record(run_dir, value, step, lambda: monitoring.measure(
-                model, tokenizer, datasets["validation"], value, device))
-        finally:
-            # Evaluation must not consume training RNG even if implementation
-            # changes later, or if a monitoring OOM aborts this worker.
-            restore_rng(saved_rng)
-        log({"event": "greedy_monitor", "step": step, "scores": result["scores"],
-             "counts": result["counts"], "n": result["n"], "seconds": result["seconds"]})
-
     try:
         with StopRequest() as stop:
             log({"event": "initialized", "step": step, "seconds": time.monotonic() - started})
@@ -273,8 +253,6 @@ def train(work, value, resume=None, session_updates=None):
                 before = time.monotonic()
                 result = validation_loss(model, tokenizer, datasets["validation"], value, device)
                 log({"event": "validation", "step": 0, "seconds": time.monotonic() - before, **result})
-            if not stop.requested:
-                monitor()  # Also repairs interrupted diagnostics at a resumed boundary.
             while step < value["max_steps"] and not stop.requested:
                 learning_rate = lr_for_update(value, step)
                 for group in opt.param_groups:
@@ -300,8 +278,6 @@ def train(work, value, resume=None, session_updates=None):
                     before = time.monotonic()
                     result = validation_loss(model, tokenizer, datasets["validation"], value, device)
                     log({"event": "validation", "step": step, "seconds": time.monotonic() - before, **result})
-                if not stop.requested:
-                    monitor()
                 if stopping:
                     break
             save("session end")
