@@ -29,8 +29,8 @@ def main():
     commands.add_parser("plan", help="Read-only; no ML/network/GPU work")
     execute = commands.add_parser("run", help="ON POD: pinned import, validation, approval and normal grid")
     execute.add_argument("--accept-pair", action="store_true", help="Approve reviewed quality/override and passed smoke evidence")
-    execute.add_argument("--override-quality", metavar="REASON",
-                         help="Accept a completed quality-threshold failure with an audited reason; never bypass integrity/smoke checks")
+    execute.add_argument("--override-quality", action="store_true",
+                         help="Accept a completed quality-threshold failure; never bypass integrity/smoke checks")
     execute.add_argument("--accept-grid-estimate", action="store_true")
     commands.add_parser("verify", help="Read-only full byte/provenance verification of an approved pair")
     worker = commands.add_parser("_worker", help=argparse.SUPPRESS)

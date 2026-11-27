@@ -80,12 +80,6 @@ def override_identity(binding):
             "quality_complete_sha256": binding["quality_complete_sha256"]}
 
 
-def valid_reason(reason):
-    if not isinstance(reason, str) or not reason.strip() or len(reason.strip()) > 4000:
-        raise ValueError("--override-quality requires a nonempty reason of at most 4000 characters")
-    return reason.strip()
-
-
 def current_override(root, definition, full=True):
     directory = Path(root) / RELATIVE
     if not directory.exists():
@@ -98,22 +92,17 @@ def current_override(root, definition, full=True):
             or value.get("binding") != binding or value.get("failed_gates") != failed
             or value.get("observed_quality") != quality):
         raise ValueError("Quality override is stale, foreign, or inconsistent")
-    valid_reason(value.get("reason"))
     if type(value.get("unix_time")) not in (int, float) or not math.isfinite(value["unix_time"]):
         raise ValueError("Quality override lacks an audit timestamp")
     return value
 
 
-def record_override(work, reason):
+def record_override(work):
     """Called under the controller lock; never edit the definition or failed report."""
-    reason = valid_reason(reason)
     root, definition = pair_root(work), request(work)["definition"]
     directory = root / RELATIVE
     if directory.exists():
-        value = current_override(root, definition)
-        if value["reason"] != reason:
-            raise ValueError("Existing quality override has a different reason; it will not be overwritten")
-        return value
+        return current_override(root, definition)
     if (root / "prepared_pair.json").exists() or (Path(definition["grid_work"]) / "binding.json").exists():
         raise ValueError("Cannot introduce a quality override after pair publication/grid binding")
     if not (root / "reports/quality/COMPLETE.json").is_file():
@@ -122,7 +111,7 @@ def record_override(work, reason):
     if not failed:
         raise ValueError("Quality already passed; an override is unnecessary")
     value = {"kind": KIND, "scope": "quality-thresholds-only", "accepted": True,
-             "reason": reason, "unix_time": time.time(), "binding": binding,
+             "unix_time": time.time(), "binding": binding,
              "failed_gates": failed, "observed_quality": quality, "source_fingerprints": code()}
     scratch = temporary(directory)
     atomic_json(scratch / "report.json", value)

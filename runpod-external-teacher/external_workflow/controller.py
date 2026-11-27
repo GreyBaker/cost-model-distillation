@@ -147,9 +147,8 @@ def run(args):
         args.restored_root if args.student == "restored" else None,
         args.reference_python if args.student == "restored" else None)
     os.environ["POD_DISK"] = str(disk)
-    reason = getattr(args, "override_quality", None)
-    if reason is not None:
-        quality_policy.valid_reason(reason)
+    override_requested = getattr(args, "override_quality", False)
+    if override_requested:
         if not (pair_root(work) / "reports/quality/COMPLETE.json").is_file():
             raise ValueError("Run normally first and review the completed quality report before overriding")
     from plan import validate
@@ -184,8 +183,8 @@ def run(args):
             else:
                 shutil.copyfile(source, target)
         append(work / "source_provenance.jsonl", {"source_fingerprints": code()})
-        if reason is not None:
-            quality_policy.record_override(work, reason)
+        if override_requested:
+            quality_policy.record_override(work)
         reviewed = reviewed_pair(work) if args.accept_pair else None
         runner = Runner(work, stop)
 
@@ -246,10 +245,8 @@ def run(args):
                 if override is None:
                     status("rejected_quality", report=str(pair_root(work) / "reports/quality/report.json"))
                     raise ValueError("External teacher failed quality gates. Review the report; "
-                                     "run --override-quality \"YOUR REASON\" to waive only statistical quality thresholds. "
+                                     "run --override-quality to waive only statistical quality thresholds. "
                                      "No grid or automatic SFT launched.")
-                message(f"WARNING: QUALITY FAILURE OVERRIDDEN: {override['failed_gates']} | {override['reason']}. "
-                        "Integrity, smoke-test and grid-approval guards remain mandatory.")
             if not runner.worker("smoke"):
                 status("paused")
                 return

@@ -72,7 +72,7 @@
     "proposed_min_paired_95ci_lower_bound": 0.0,
     "quality_gate_status": "proposed operational criteria, not paper requirements or measured results",
     "operator_approval_before_binding": true,
-    "quality_failure_override": "explicit operator reason after completed evaluation; separate immutable model/data/report-bound waiver; no integrity or smoke bypass",
+    "quality_failure_override": "explicit boolean flag after completed evaluation; no message required; separate immutable model/data/report-bound waiver; no integrity or smoke bypass",
     "publisher_scores_are_independently_verified": false,
     "test_split_used_for_decisions": false,
     "periodic_greedy_monitor": false
