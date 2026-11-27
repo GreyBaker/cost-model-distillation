@@ -72,6 +72,7 @@
     "proposed_min_paired_95ci_lower_bound": 0.0,
     "quality_gate_status": "proposed operational criteria, not paper requirements or measured results",
     "operator_approval_before_binding": true,
+    "quality_failure_override": "explicit operator reason after completed evaluation; separate immutable model/data/report-bound waiver; no integrity or smoke bypass",
     "publisher_scores_are_independently_verified": false,
     "test_split_used_for_decisions": false,
     "periodic_greedy_monitor": false
@@ -98,7 +99,7 @@
     "common_initialization": "same immutable FP32 selected SFT student for every cell",
     "cell_restart": "full optimizer/RNG/cursor checkpoint; existing typed-CUDA-OOM smaller-microbatch recovery",
     "training_fit_pilot": "existing joint student/teacher hardware pilot; no SFT pilot",
-    "evaluation_batch_pilot": "existing once-only student-only capacity calibration with tested safety margin",
+    "evaluation_batch_pilot": "once-only student-only fit and warmed-throughput calibration with tested safety ceiling; historical pilots reused unchanged",
     "baseline": "existing full common baseline in the new runtime",
     "estimate_approval_required": true,
     "reuse_old_grid_binding_or_pilots": false,

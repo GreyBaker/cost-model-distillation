@@ -1,4 +1,4 @@
-"""Once-only student-inference batch calibration, independent of training fit."""
+"""Once-only inference fit/throughput calibration, independent of training fit."""
 from __future__ import annotations
 
 import math
@@ -11,8 +11,19 @@ from .shared import atomic_json, read_json, sha256, verify_tree
 from sftlib.console import message, progress
 
 
-def request(root, bound, selected):
-    return {"version": 1, "binding_sha256": sha256(root / "binding.json"),
+def request(root, bound, selected, version=None):
+    if version is None:
+        # Published/unfinished historical calibrations retain their original
+        # policy. Updating source code must never force recalibration/rebinding.
+        if (root / "evaluation_pilot.json").exists():
+            version = read_json(root / "evaluation_pilot.json")["request"]["version"]
+        elif (root / "evaluation_pilot_request.json").exists():
+            version = read_json(root / "evaluation_pilot_request.json")["version"]
+        else:
+            version = 2
+    if type(version) is not int or version not in (1, 2):
+        raise ValueError("Unsupported evaluation-pilot policy version")
+    result = {"version": version, "binding_sha256": sha256(root / "binding.json"),
             # Current binding() return, NOT binding.json's original code record.
             # Conservative superset of inference sources; provenance, never a gate.
             "source_fingerprints": bound.get("code", {}),
@@ -25,7 +36,11 @@ def request(root, bound, selected):
             "repeats": bound["settings"]["pilot_updates"],
             "stress": {"source_tokens": 1024, "generation_tokens": 64,
                        "precision": "bfloat16", "sample": False, "force_cap": True,
-                       "teacher_loaded": False}}
+                        "teacher_loaded": False}}
+    if version == 2:
+        result.update(selection_policy="warmed-stress-throughput-v1",
+                      throughput_near_best_fraction=.98)
+    return result
 
 
 def semantic_request(value):
@@ -93,6 +108,48 @@ def select_batch(probe, expected):
     return maximum, batch
 
 
+def speed_candidates(ceiling):
+    """Bounded log-spaced sweep plus quarters near the measured safe ceiling."""
+    batches = {1, ceiling}
+    size = 1
+    while size <= ceiling:
+        batches.add(size)
+        size *= 2
+    batches.update(max(1, ceiling * numerator // 4) for numerator in (1, 2, 3))
+    return sorted(batches)
+
+
+def warmed_throughput(result, batch):
+    seconds = result["generation_seconds"][1:]  # Exclude the first warmup.
+    return batch / (sum(seconds) / len(seconds))
+
+
+def select_throughput(probe, expected, rate):
+    observed = {}
+    def measured(batch):
+        observed[batch] = probe(batch)
+        return observed[batch]
+    maximum, ceiling = select_batch(measured, expected)
+    for batch in speed_candidates(ceiling):
+        measured(batch)
+    # Binary fit search can also measure non-sweep batches below the safety
+    # ceiling. Do not discard a faster eligible measurement already paid for.
+    passing = [batch for batch, passed in observed.items() if passed and batch <= ceiling]
+    rates = {batch: rate(batch) for batch in passing}
+    if any(not math.isfinite(value) or value <= 0 for value in rates.values()):
+        raise ValueError("Invalid warmed evaluation throughput")
+    fastest = max(passing, key=lambda batch: (rates[batch], -batch))
+    # Avoid spending memory for <=2% timing noise/throughput gain.
+    chosen = min(batch for batch in passing
+                 if rates[batch] >= rates[fastest] * expected["throughput_near_best_fraction"])
+    return maximum, chosen, {
+        "safety_ceiling_batch": ceiling,
+        "fastest_measured_batch": fastest,
+        "fastest_measured_summaries_per_second": rates[fastest],
+        "warmed_summaries_per_second": rates[chosen],
+    }
+
+
 def verify_trial(result, expected, batch):
     if (semantic_request(result.get("request", {})) != semantic_request(expected)
             or type(result.get("batch_size")) is not int or result["batch_size"] != batch
@@ -107,8 +164,14 @@ def verify_trial(result, expected, batch):
         if (result["status"] == "pass") != (result["peak_reserved_bytes"] <= limit):
             raise ValueError("Evaluation-pilot headroom status disagrees with measured memory")
         if (len(result.get("generation_seconds", [])) != expected["repeats"]
-                or any(not math.isfinite(x) or x <= 0 for x in result["generation_seconds"])):
+                or any(type(x) not in (int, float) or not math.isfinite(x) or x <= 0
+                       for x in result["generation_seconds"])):
             raise ValueError("Invalid evaluation-pilot timing coverage")
+        if "warmed_summaries_per_second" in result:
+            rate = result["warmed_summaries_per_second"]
+            if (type(rate) not in (int, float) or not math.isfinite(rate) or rate <= 0
+                    or not math.isclose(rate, warmed_throughput(result, batch), rel_tol=1e-12)):
+                raise ValueError("Reported evaluation throughput differs from measured timings")
     return result["status"] == "pass"
 
 
@@ -125,7 +188,7 @@ def _saved(root, bound, selected):
     expected = request(root, bound, selected)
     if semantic_request(value.get("request", {})) != semantic_request(expected):
         raise ValueError("Saved evaluation pilot differs from bound model/settings/runtime")
-    trials = {}
+    trials, results = {}, {}
     for entry in value["result_files"]:
         path = Path(entry["path"])
         if sha256(path) != entry["sha256"]:
@@ -135,6 +198,7 @@ def _saved(root, bound, selected):
         if type(batch) is not int or not 1 <= batch <= expected["search_cap"] or batch in trials:
             raise ValueError("Invalid/duplicate evaluation-pilot batch")
         trials[batch] = verify_trial(result, expected, batch)
+        results[batch] = result
     visited = set()
 
     def replay(batch):
@@ -143,12 +207,18 @@ def _saved(root, bound, selected):
         visited.add(batch)
         return trials[batch]
 
-    maximum, batch = select_batch(replay, expected)
+    details = {}
+    if expected["version"] == 1:
+        maximum, batch = select_batch(replay, expected)
+    else:
+        maximum, batch, details = select_throughput(
+            replay, expected, lambda size: warmed_throughput(results[size], size))
     if (type(value["max_passing_batch"]) is not int or value["max_passing_batch"] != maximum
             or type(value["batch_size"]) is not int or value["batch_size"] != batch
             or type(value.get("search_cap_reached")) is not bool
             or value["search_cap_reached"] != (maximum == expected["search_cap"])
-            or visited != set(trials)):
+            or visited != set(trials)
+            or any(value.get(key) != item for key, item in details.items())):
         raise ValueError("Saved evaluation-pilot selection/cap flag differs from deterministic search")
     return value
 
@@ -188,39 +258,55 @@ def ensure(root, bound, selected, runner):
     cached_requests += [read_json(path).get("request", {})
                         for path in sorted((root / "evaluation_pilots").glob("batch-*.json"))]
     record_provenance(root, expected, cached_requests, "search_start_or_resume")
-    # Conservative bound: exponential + binary search plus halving safety chain.
+    # Exponential + binary search plus halving safety chain. The powers in the
+    # throughput sweep are already capacity probes; at most three quarters add work.
     probe_bound = 3 * math.ceil(math.log2(expected["search_cap"] + 1)) + 2
+    if expected["version"] == 2:
+        probe_bound += 3
     message(f"Evaluation calibration: at most {probe_bound} distinct candidate subprocesses "
             f"({probe_bound * expected['repeats']} full 1024/forced-64 stress repetitions). "
             "Cached candidates cost no generation; each fresh process loads the student, "
             "verifies checkpoint hashes and scans validation lengths.")
-    files = {}
+    files, results = {}, {}
 
     def probe(batch):
         output = root / "evaluation_pilots" / f"batch-{batch:05d}.json"
         if not output.exists():
             if not runner.call("evaluation_pilot", "shared", "--microbatch", batch, "--output", output):
                 raise InterruptedError("Evaluation pilot paused; completed candidates are preserved")
-        passed = verify_trial(read_json(output), expected, batch)
+        result = read_json(output)
+        passed = verify_trial(result, expected, batch)
+        results[batch] = result
         files[batch] = {"path": str(output), "sha256": sha256(output)}
         return passed
 
     try:
-        maximum, batch = select_batch(probe, expected)
+        details = {}
+        if expected["version"] == 1:
+            maximum, batch = select_batch(probe, expected)
+        else:
+            maximum, batch, details = select_throughput(
+                probe, expected, lambda size: warmed_throughput(results[size], size))
     except InterruptedError:
         return False
     atomic_json(root / "evaluation_pilot.json", {
         "request": expected, "max_passing_batch": maximum, "batch_size": batch,
         "search_cap_reached": maximum == expected["search_cap"],
-        "selection": "largest measured stress-fit batch with reserved headroom, then batch safety fraction",
-        "limitation": "Monotonic-fit search, not a throughput optimum; later checkpoint OOMs retain bounded fallback",
+        **details,
+        "selection": ("largest measured stress-fit batch with reserved headroom, then batch safety fraction"
+                      if expected["version"] == 1 else
+                      "smallest measured batch within 2% of best warmed throughput, below tested safety ceiling"),
+        "limitation": "Bounded stress-workload sweep, not an exhaustive real-pool throughput optimum; "
+                      "later checkpoint OOMs retain bounded fallback",
         "result_files": [files[k] for k in sorted(files)]})
     saved(root, bound, selected)
     record_provenance(root, expected,
                       [read_json(request_path), *[read_json(Path(entry["path"]))["request"]
                                                  for entry in files.values()]], "published")
     message(f"Evaluation pilot selected shared batch {batch}; max passing {maximum}, "
-            f"safety fraction {expected['safety_fraction']:.0%}.")
+            f"safety fraction {expected['safety_fraction']:.0%}."
+            + (f" Warmed stress throughput {details['warmed_summaries_per_second']:.2f} summaries/s."
+               if details else ""))
     return True
 
 

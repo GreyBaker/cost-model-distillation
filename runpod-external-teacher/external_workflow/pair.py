@@ -9,9 +9,10 @@ from .acquire import matches
 from .common import (PAIR_KIND, PROFILE, ROOT, atomic_json, code, digest, environment, identity,
                      owned, pair_root, read_json, request, sha256, verify)
 from gridlib.policy import PROTOCOL
+from . import quality_policy
 
 
-def expected_artifacts(definition):
+def expected_artifacts(definition, quality_overridden=False):
     names = {
         "teacher_source": "sources/teacher", "xsum_source": "sources/xsum",
         "tokenizers": "reports/tokenizers", "corpus": "reports/corpus",
@@ -24,6 +25,8 @@ def expected_artifacts(definition):
     else:
         names.update(legacy_tokenizer="reports/legacy_tokenizer", legacy_probe="reports/legacy_probe",
                      restored_source="reports/restored_source")
+    if quality_overridden:
+        names["quality_override"] = quality_policy.RELATIVE
     return names
 
 
@@ -48,7 +51,8 @@ def inspect(root, full=True, check_runtime=True, *, _candidate=None):
     if sha256(lock_path) != pair["models_lock_sha256"] or pair["models_lock_sha256"] != definition["models_lock_sha256"]:
         raise ValueError("Frozen external source lock changed")
     locked = read_json(lock_path)
-    expected = expected_artifacts(definition)
+    quality_overridden = "quality_override" in pair["artifacts"]
+    expected = expected_artifacts(definition, quality_overridden)
     if set(pair["artifacts"]) != set(expected):
         raise ValueError("External pair lacks required evidence")
     markers = {}
@@ -173,14 +177,14 @@ def inspect(root, full=True, check_runtime=True, *, _candidate=None):
     if markers["quality"]["identity"] != quality_identity:
         raise ValueError("Quality gate is not for this pair's actual evaluations")
     quality = read_json(root / expected["quality"] / "report.json")
-    t = definition["thresholds"]
-    numeric = [*quality["scores"].values(), quality["advantage"], *quality["paired_bootstrap_95ci"]]
-    if any(type(x) not in (float, int) or not math.isfinite(x) for x in numeric):
-        raise ValueError("Nonfinite quality evidence")
-    if (quality.get("passed") is not True or quality.get("n") != 11332 or quality.get("thresholds") != t
-            or quality["scores"]["teacher"] < t["teacher_r2"] or quality["advantage"] < t["advantage"]
-            or quality["paired_bootstrap_95ci"][0] <= t["ci_lower"]):
-        raise ValueError("External teacher quality gate failed")
+    failed = quality_policy.failed_gates(quality, definition["thresholds"])
+    override = None
+    if failed:
+        if not quality_overridden:
+            raise ValueError("External teacher quality gate failed; an explicit quality override is required")
+        override = quality_policy.current_override(root, definition, full=full)
+    elif quality_overridden:
+        raise ValueError("Passing quality evidence must not claim an override")
     for role in ("teacher", "student"):
         actual_r2 = read_json(root / expected[role + "_validation"] / "metrics.json")["scores"]["rouge2"]
         if quality["scores"][role] != actual_r2:
@@ -199,11 +203,17 @@ def inspect(root, full=True, check_runtime=True, *, _candidate=None):
             or approval.get("quality_complete_sha256") != pair["artifacts"]["quality"]["complete_sha256"]
             or approval.get("smoke_complete_sha256") != pair["artifacts"]["smoke"]["complete_sha256"]):
         raise ValueError("Explicit external-pair approval is missing or stale")
+    if quality_overridden:
+        if (override is None or approval.get("quality_override_complete_sha256")
+                != pair["artifacts"]["quality_override"]["complete_sha256"]):
+            raise ValueError("Quality override is not bound to explicit pair approval")
+    elif "quality_override_complete_sha256" in approval:
+        raise ValueError("Pair approval refers to missing quality-override evidence")
     if pair["runtime"]["environment"]["packages"]["transformers"] != "5.20.2":
         raise ValueError("External pair was not validated with its native runtime")
     if check_runtime and environment() != pair["runtime"]["environment"]:
         raise ValueError("Use the exact validated native external environment, not the old SFT venv")
-    return {"kind": PAIR_KIND, "sft_work": str(root),
+    result = {"kind": PAIR_KIND, "sft_work": str(root),
             "paths": {"student_checkpoint": str(root / expected["student"]),
                       "teacher_export": str(root / expected["teacher"])},
             "hashes": {"prepared_pair": sha256(root / "prepared_pair.json") if _candidate is None else digest(pair),
@@ -212,6 +222,9 @@ def inspect(root, full=True, check_runtime=True, *, _candidate=None):
                        "teacher": {"export": pair["artifacts"]["teacher"]["complete_sha256"]}},
             "external_provenance": {"student_mode": definition["student"], "local_sft_updates": 0,
                                     "sources": locked, "approval": approval}}
+    if override is not None:
+        result["external_provenance"]["quality_override"] = override
+    return result
 
 
 def approve(work):
@@ -219,13 +232,14 @@ def approve(work):
     if (root / "prepared_pair.json").exists():
         return inspect(root)
     definition = request(work)["definition"]
-    names = expected_artifacts(definition)
+    override = quality_policy.current_override(root, definition)
+    names = expected_artifacts(definition, override is not None)
     artifacts = {}
     for name, relative in names.items():
         verify(owned(root, relative))
         artifacts[name] = {"path": relative, "complete_sha256": sha256(owned(root, relative) / "COMPLETE.json")}
     quality = read_json(root / "reports/quality/report.json")
-    if quality.get("passed") is not True:
+    if quality.get("passed") is not True and override is None:
         raise ValueError("Cannot approve a rejected teacher")
     value = {"kind": PAIR_KIND, "status": "complete", "definition": definition,
              "protocol": PROTOCOL, "local_sft_updates": 0, "artifacts": artifacts,
@@ -234,7 +248,9 @@ def approve(work):
              "approval": {"accepted": True, "definition_sha256": digest(definition),
                           "quality_complete_sha256": artifacts["quality"]["complete_sha256"],
                           "smoke_complete_sha256": artifacts["smoke"]["complete_sha256"],
-                          "unix_time": time.time(), "source_fingerprints": code()}}
+                           "unix_time": time.time(), "source_fingerprints": code()}}
+    if override is not None:
+        value["approval"]["quality_override_complete_sha256"] = artifacts["quality_override"]["complete_sha256"]
     # Validate all backing evidence BEFORE publishing a complete pair.
     inspect(root, _candidate=value)
     atomic_json(root / "prepared_pair.json", value)

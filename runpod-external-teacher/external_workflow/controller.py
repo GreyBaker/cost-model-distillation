@@ -14,6 +14,7 @@ from .common import (OOM_EXIT, REPO, ROOT, RunLock, append, atomic_json, check_s
 from sftlib.console import message, run_logged
 from sftlib.core import CONFIGS, configure_local_storage
 from sftlib.sequence import ChildStop, verified_student
+from . import quality_policy
 
 
 class ExternalOOM(RuntimeError):
@@ -30,8 +31,14 @@ def reviewed_pair(work):
             raise ValueError("Run without --accept-pair first, then review completed quality and smoke reports")
         verify(directory)
         if read_json(directory / "report.json").get("passed") is not True:
-            raise ValueError("Cannot approve rejected quality/smoke evidence")
+            if stage != "quality" or quality_policy.current_override(
+                    pair_root(work), read_json(Path(work) / "run.json")["definition"]) is None:
+                raise ValueError("Cannot approve rejected quality/smoke evidence without a valid quality override")
         result[stage] = sha256(directory / "COMPLETE.json")
+    override = pair_root(work) / quality_policy.RELATIVE
+    if override.exists():
+        quality_policy.current_override(pair_root(work), read_json(Path(work) / "run.json")["definition"])
+        result["quality_override"] = sha256(override / "COMPLETE.json")
     return result
 
 
@@ -140,7 +147,11 @@ def run(args):
         args.restored_root if args.student == "restored" else None,
         args.reference_python if args.student == "restored" else None)
     os.environ["POD_DISK"] = str(disk)
-    reviewed = reviewed_pair(work) if args.accept_pair else None
+    reason = getattr(args, "override_quality", None)
+    if reason is not None:
+        quality_policy.valid_reason(reason)
+        if not (pair_root(work) / "reports/quality/COMPLETE.json").is_file():
+            raise ValueError("Run normally first and review the completed quality report before overriding")
     from plan import validate
     validate(read_json(ROOT / "scheme.json"), read_json(ROOT / "models.lock.json"))
     configure_local_storage(work)
@@ -173,6 +184,9 @@ def run(args):
             else:
                 shutil.copyfile(source, target)
         append(work / "source_provenance.jsonl", {"source_fingerprints": code()})
+        if reason is not None:
+            quality_policy.record_override(work, reason)
+        reviewed = reviewed_pair(work) if args.accept_pair else None
         runner = Runner(work, stop)
 
         def status(phase, **extra):
@@ -228,8 +242,14 @@ def run(args):
             report = read_json(pair_root(work) / "reports/quality/report.json")
             message(f"Measured pair quality: {report}")
             if report["passed"] is not True:
-                status("rejected_quality", report=str(pair_root(work) / "reports/quality/report.json"))
-                raise ValueError("External teacher failed quality gates. No grid or automatic SFT launched.")
+                override = quality_policy.current_override(pair_root(work), value)
+                if override is None:
+                    status("rejected_quality", report=str(pair_root(work) / "reports/quality/report.json"))
+                    raise ValueError("External teacher failed quality gates. Review the report; "
+                                     "run --override-quality \"YOUR REASON\" to waive only statistical quality thresholds. "
+                                     "No grid or automatic SFT launched.")
+                message(f"WARNING: QUALITY FAILURE OVERRIDDEN: {override['failed_gates']} | {override['reason']}. "
+                        "Integrity, smoke-test and grid-approval guards remain mandatory.")
             if not runner.worker("smoke"):
                 status("paused")
                 return

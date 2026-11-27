@@ -56,7 +56,7 @@ def generate(student, tokenizer, inputs, sample, force_cap=False):
     import torch
     from transformers import GenerationConfig
     options = dict(max_new_tokens=64, min_new_tokens=63 if force_cap else 0,
-                   min_length=0, do_sample=sample, num_beams=1,
+                   do_sample=sample, num_beams=1,
                    no_repeat_ngram_size=0, repetition_penalty=1.0, length_penalty=1.0,
                    eos_token_id=tokenizer.eos_token_id, pad_token_id=tokenizer.pad_token_id,
                    decoder_start_token_id=student.config.decoder_start_token_id, use_cache=True)

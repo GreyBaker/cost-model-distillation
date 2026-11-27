@@ -42,7 +42,7 @@ def artifact(root, relative, expected, files, **metadata):
     return sha256(final / "COMPLETE.json")
 
 
-def fixture(work, mode="public", full_rows=True):
+def fixture(work, mode="public", full_rows=True, thresholds=None):
     root = work / "pair"
     root.mkdir(parents=True)
     locked = read_json(common.ROOT / "models.lock.json")
@@ -60,7 +60,8 @@ def fixture(work, mode="public", full_rows=True):
     atomic_json(root / "models.lock.json", locked)
     definition = {"student": mode, "models_lock_sha256": sha256(root / "models.lock.json"),
                   "restored_checkpoint_complete_sha256": "e" * 64 if mode == "restored" else None,
-                  "thresholds": {"teacher_r2": 20., "advantage": 1., "ci_lower": 0.}}
+                  "thresholds": thresholds or {"teacher_r2": 20., "advantage": 1., "ci_lower": 0.},
+                  "grid_work": str(work.parent / "grid")}
     atomic_json(work / "run.json", {"definition": definition})
     atomic_json(work / "native_runtime.json", RUNTIME)
     hashes = {}
@@ -126,7 +127,10 @@ def fixture(work, mode="public", full_rows=True):
             {"metrics.json": metrics, "predictions.jsonl": predictions})
     hashes["quality"] = artifact(root, names["quality"], pair.stage_identity(definition, "quality",
         validation={role: hashes[role + "_validation"] for role in ("teacher", "student")}),
-        {"report.json": {"passed": True, "n": 11332, "scores": {"teacher": 21., "student": 10.},
+        {"report.json": {"passed": bool(21. >= definition["thresholds"]["teacher_r2"]
+                                       and 11. >= definition["thresholds"]["advantage"]
+                                       and 10. > definition["thresholds"]["ci_lower"]),
+                         "n": 11332, "scores": {"teacher": 21., "student": 10.},
                          "advantage": 11., "paired_bootstrap_95ci": [10., 12.], "thresholds": definition["thresholds"]}})
     hashes["smoke"] = artifact(root, names["smoke"], pair.stage_identity(definition, "smoke",
         models={role: hashes[role] for role in ("student", "teacher")}), {"report.json": {"passed": True}})
@@ -362,10 +366,14 @@ class ModelContractTests(unittest.TestCase):
         model = SimpleNamespace(config=SimpleNamespace(decoder_start_token_id=0),
                                 generate=lambda **kwargs: IDs())
         tok = SimpleNamespace(eos_token_id=1, pad_token_id=0)
+        def generation_config(**kwargs):
+            self.assertNotIn("min_length", kwargs)
+            self.assertEqual(kwargs["min_new_tokens"], 0)
+            return SimpleNamespace(**kwargs)
         torch = SimpleNamespace(no_grad=contextlib.nullcontext, bfloat16="bf16",
                                 autocast=lambda *a, **k: contextlib.nullcontext())
         with patch.dict("sys.modules", {"torch": torch,
-                "transformers": SimpleNamespace(GenerationConfig=lambda **kwargs: SimpleNamespace(**kwargs))}), \
+                "transformers": SimpleNamespace(GenerationConfig=generation_config)}), \
                 patch.object(torch, "autocast", wraps=torch.autocast) as autocast:
             models.greedy(model, tok, {}, bf16=False)
             autocast.assert_not_called()

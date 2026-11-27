@@ -82,7 +82,7 @@ def loss_sum(model, inputs, labels, z_loss=0.0):
 def generate(model, tokenizer, inputs, limit):
     import torch
     from transformers import GenerationConfig
-    settings = GenerationConfig(max_new_tokens=limit, do_sample=False, num_beams=1, min_length=0,
+    settings = GenerationConfig(max_new_tokens=limit, do_sample=False, num_beams=1,
                                 min_new_tokens=0, no_repeat_ngram_size=0, repetition_penalty=1.0,
                                 length_penalty=1.0, eos_token_id=tokenizer.eos_token_id,
                                 pad_token_id=tokenizer.pad_token_id,

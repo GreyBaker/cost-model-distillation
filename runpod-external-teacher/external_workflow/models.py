@@ -85,7 +85,7 @@ def greedy(model, tokenizer, inputs, bf16=False):
     from contextlib import nullcontext
     from transformers import GenerationConfig
     config = GenerationConfig(max_new_tokens=64, do_sample=False, num_beams=1,
-        min_length=0, min_new_tokens=0, no_repeat_ngram_size=0, repetition_penalty=1.0,
+        min_new_tokens=0, no_repeat_ngram_size=0, repetition_penalty=1.0,
         length_penalty=1.0, eos_token_id=tokenizer.eos_token_id, pad_token_id=tokenizer.pad_token_id,
         decoder_start_token_id=model.config.decoder_start_token_id, use_cache=True)
     context = torch.autocast("cuda", dtype=torch.bfloat16) if bf16 else nullcontext()

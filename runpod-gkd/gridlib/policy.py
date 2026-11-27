@@ -128,8 +128,9 @@ def plan():
                        for key in ("budget_points", "points", "examples", "on_policy_examples",
                                    "off_policy_examples", "updates", "unspent_points")},
             "validation_generations_including_baseline": VALIDATION_N * (len(grid) + 1),
-            "evaluation_batch_policy": "Once-only independent student-inference stress pilot; integer fit search "
-                                       "to evaluation_batch_cap, then tested safety fraction; shared by baseline/all cells",
+            "evaluation_batch_policy": "Once-only student-inference pilot: stress-fit search, tested safety ceiling, "
+                                       "then warmed-throughput sweep; smallest batch within 2% of fastest tested. "
+                                       "Shared by baseline/all cells; historical pilots remain reusable unchanged",
             "runtime_scenarios": [
                 {"assumed_points_per_second": rate,
                  "training_hours": sum(row["points"] for row in grid) / rate / 3600}

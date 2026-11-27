@@ -33,6 +33,8 @@ def main():
     suite = unittest.TestSuite([
         unittest.defaultTestLoader.discover(str(ROOT), pattern="test_*.py"),
         unittest.defaultTestLoader.discover(str(ROOT), pattern="check_scheme.py"),
+        unittest.defaultTestLoader.discover(str(ROOT.parent / "runpod-gkd"), pattern="test_eval_throughput.py",
+                                           top_level_dir=str(ROOT.parent / "runpod-gkd")),
     ])
     with patch.object(socket.socket, "connect", side_effect=AssertionError("Network blocked by mocked checks")):
         result = unittest.TextTestRunner(verbosity=1).run(suite)
