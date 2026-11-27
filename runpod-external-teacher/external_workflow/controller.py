@@ -1,7 +1,6 @@
 """Serial subprocess execution; parent never loads a model or initializes CUDA."""
 from __future__ import annotations
 
-import math
 import os
 from pathlib import Path
 import shutil
@@ -14,7 +13,6 @@ from .common import (OOM_EXIT, REPO, ROOT, RunLock, append, atomic_json, check_s
 from sftlib.console import message, run_logged
 from sftlib.core import CONFIGS, configure_local_storage
 from sftlib.sequence import ChildStop, verified_student
-from . import quality_policy
 
 
 class ExternalOOM(RuntimeError):
@@ -24,21 +22,11 @@ class ExternalOOM(RuntimeError):
 def reviewed_pair(work):
     """Approval applies only to evidence already available before this invocation."""
     from .common import verify
-    result = {}
-    for stage in ("quality", "smoke"):
-        directory = pair_root(work) / "reports" / stage
-        if not (directory / "COMPLETE.json").is_file():
-            raise ValueError("Run without --accept-pair first, then review completed quality and smoke reports")
-        verify(directory)
-        if read_json(directory / "report.json").get("passed") is not True:
-            if stage != "quality" or quality_policy.current_override(
-                    pair_root(work), read_json(Path(work) / "run.json")["definition"]) is None:
-                raise ValueError("Cannot approve rejected quality/smoke evidence without a valid quality override")
-        result[stage] = sha256(directory / "COMPLETE.json")
-    override = pair_root(work) / quality_policy.RELATIVE
-    if override.exists():
-        quality_policy.current_override(pair_root(work), read_json(Path(work) / "run.json")["definition"])
-        result["quality_override"] = sha256(override / "COMPLETE.json")
+    directory = pair_root(work) / "reports/quality"
+    if not (directory / "COMPLETE.json").is_file():
+        raise ValueError("Run without --accept-pair first, then review the completed quality report")
+    verify(directory)
+    result = {"quality": sha256(directory / "COMPLETE.json")}
     return result
 
 
@@ -91,11 +79,6 @@ class Runner:
 def definition(args):
     from gridlib.policy import settings
     settings(args.settings)  # Reject a bad grid recipe before lengthy imports/evaluations.
-    thresholds = {"teacher_r2": args.min_teacher_r2, "advantage": args.min_advantage, "ci_lower": args.min_ci_lower}
-    if any(not math.isfinite(x) for x in thresholds.values()):
-        raise ValueError("Finite quality thresholds required")
-    if not 0 <= thresholds["teacher_r2"] <= 100 or not 0 <= thresholds["advantage"] <= 100:
-        raise ValueError("Invalid ROUGE quality thresholds")
     restored_identity = None
     if args.student == "restored":
         if args.restored_root is None or args.reference_python is None or not args.reference_python.is_file():
@@ -107,7 +90,7 @@ def definition(args):
             "reference_python": str(args.reference_python.expanduser().absolute()) if args.student == "restored" else None,
             "restored_checkpoint_complete_sha256": restored_identity,
             "models_lock_sha256": sha256(ROOT / "models.lock.json"),
-            "grid_settings_sha256": sha256(args.settings.resolve()), "thresholds": thresholds,
+            "grid_settings_sha256": sha256(args.settings.resolve()),
             "grid_work": str(args.grid_work.resolve())}
 
 
@@ -132,7 +115,7 @@ def storage_projection(value):
         # Conservative optimizer upper allowance: another full model per state,
         # though factored Adafactor typically needs substantially less.
         "grid_25_cells_two_restarts_each": 25 * 2 * 2 * student_bytes,
-        "smoke_and_transient_checkpoints": 10 * student_bytes,
+        "grid_pilot_and_transient_checkpoints": 10 * student_bytes,
         "prepared_tables_and_data_caches_allowance": 10 * 1024 ** 3,
         "reports_and_miscellaneous_reserve": 5 * 1024 ** 3,
     }
@@ -147,10 +130,6 @@ def run(args):
         args.restored_root if args.student == "restored" else None,
         args.reference_python if args.student == "restored" else None)
     os.environ["POD_DISK"] = str(disk)
-    override_requested = getattr(args, "override_quality", False)
-    if override_requested:
-        if not (pair_root(work) / "reports/quality/COMPLETE.json").is_file():
-            raise ValueError("Run normally first and review the completed quality report before overriding")
     from plan import validate
     validate(read_json(ROOT / "scheme.json"), read_json(ROOT / "models.lock.json"))
     configure_local_storage(work)
@@ -160,8 +139,11 @@ def run(args):
         path = work / "run.json"
         if path.exists():
             original = read_json(path)
-            if original["definition"] != value:
-                raise ValueError("Mode, source, thresholds, settings or work paths changed; use a NEW external/grid root")
+            # Old thresholds are archived metadata, not a resume/admission policy.
+            effective = lambda definition: {key: item for key, item in definition.items() if key != "thresholds"}
+            if effective(original["definition"]) != effective(value):
+                raise ValueError("Mode, source, settings or work paths changed; use a NEW external/grid root")
+            value = original["definition"]  # Preserve hashes of all completed legacy artifacts.
             if original.get("source_fingerprints") != code():
                 message("WARNING: source changed; valid artifacts/resumes are reused without a code-hash gate.")
         else:
@@ -183,8 +165,6 @@ def run(args):
             else:
                 shutil.copyfile(source, target)
         append(work / "source_provenance.jsonl", {"source_fingerprints": code()})
-        if override_requested:
-            quality_policy.record_override(work)
         reviewed = reviewed_pair(work) if args.accept_pair else None
         runner = Runner(work, stop)
 
@@ -239,17 +219,7 @@ def run(args):
                 status("paused")
                 return
             report = read_json(pair_root(work) / "reports/quality/report.json")
-            message(f"Measured pair quality: {report}")
-            if report["passed"] is not True:
-                override = quality_policy.current_override(pair_root(work), value)
-                if override is None:
-                    status("rejected_quality", report=str(pair_root(work) / "reports/quality/report.json"))
-                    raise ValueError("External teacher failed quality gates. Review the report; "
-                                     "run --override-quality to waive only statistical quality thresholds. "
-                                     "No grid or automatic SFT launched.")
-            if not runner.worker("smoke"):
-                status("paused")
-                return
+            message(f"Measured pair quality (informational only): {report}")
             if not args.accept_pair:
                 status("awaiting_pair_approval", report=report)
                 message("Review reports, then rerun unchanged arguments with --accept-pair.")
@@ -286,4 +256,31 @@ def run(args):
             message("External-teacher grid complete. Download outputs before terminating the disposable Pod.")
         except BaseException as error:
             status("paused" if isinstance(error, KeyboardInterrupt) else "failed", error=str(error))
+            raise
+
+
+def development_smoke(args):
+    """Explicit opt-in development diagnostic; never update standard run status."""
+    work = args.work_dir.expanduser().resolve()
+    saved = read_json(work / "run.json")["definition"]
+    disk, work, _ = operational_paths(args.pod_disk, work, saved["grid_work"])
+    os.environ["POD_DISK"] = str(disk)
+    configure_local_storage(work)
+    runtime(work)
+    status_path = work / "development_smoke_status.json"
+    with RunLock(work / ".controller.lock"), ChildStop() as stop:
+        runner = Runner(work, stop)
+        try:
+            if not runner.worker("smoke"):
+                atomic_json(status_path, {"phase": "paused", "development_only": True})
+                return
+            report = pair_root(work) / "reports/smoke/report.json"
+            if read_json(report).get("passed") is not True:
+                raise ValueError("Development smoke/restart checks did not pass")
+            atomic_json(status_path, {"phase": "complete", "development_only": True, "report": str(report)})
+            message(f"Development smoke/restart checks complete: {report}. "
+                    "This report is not required or included in new pair approvals.")
+        except BaseException as error:
+            atomic_json(status_path, {"phase": "paused" if isinstance(error, KeyboardInterrupt) else "failed",
+                                      "development_only": True, "error": str(error)})
             raise

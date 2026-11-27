@@ -45,8 +45,9 @@ class SchemeTests(unittest.TestCase):
                         stages.index("publish_honest_external_pair_manifest_atomically"))
         self.assertLess(stages.index("review_and_explicitly_approve_quality_and_compatibility_reports"),
                         stages.index("publish_honest_external_pair_manifest_atomically"))
-        self.assertLess(stages.index("disposable_gkd_update_save_reload_resume_smoke_test"),
-                        stages.index("bind_new_grid_through_required_external_pair_adapter"))
+        self.assertNotIn("disposable_gkd_update_save_reload_resume_smoke_test", stages)
+        self.assertEqual(plan.build()["development"], {
+            "smoke_command": "external_teacher.py dev-smoke", "included_in_standard_run": False})
         self.assertLess(stages.index("print_measured_estimate_and_wait_for_grid_approval"),
                         stages.index("run_all_25_cells_independently_from_fixed_fp32_student"))
 

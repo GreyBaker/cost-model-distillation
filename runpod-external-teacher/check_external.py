@@ -32,15 +32,15 @@ class NoML(importlib.abc.MetaPathFinder):
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     selection = parser.add_mutually_exclusive_group()
-    selection.add_argument("--quality-override", action="store_true",
-                           help="Run only the focused statistical quality-override checks")
+    selection.add_argument("--quality-report", "--quality-override", dest="quality_report", action="store_true",
+                           help="Run only informational-quality, integrity and legacy-compatibility checks")
     selection.add_argument("--all", action="store_true", help="Run the full regression suite (default)")
     args = parser.parse_args(argv)
     blocker = NoML()
     sys.meta_path.insert(0, blocker)
     try:
         with patch.object(socket.socket, "connect", side_effect=AssertionError("Network blocked by mocked checks")):
-            if args.quality_override:
+            if args.quality_report:
                 suite = unittest.defaultTestLoader.loadTestsFromName("test_quality_override")
             else:
                 suite = unittest.TestSuite([

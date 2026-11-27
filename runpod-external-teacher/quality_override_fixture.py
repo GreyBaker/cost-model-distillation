@@ -29,8 +29,9 @@ def artifact(root, relative, identity, files, **metadata):
     return sha256(directory / "COMPLETE.json")
 
 
-def failed_pair(work):
-    """Unpublished, complete failed evaluation, including all 11,332 prediction rows."""
+def failed_pair(work, *, metric_offsets=None, teacher_minimum=25.):
+    """Complete evaluation, failed by default; optional offsets model float roundoff."""
+    metric_offsets = metric_offsets or {}
     root = work / "pair"
     root.mkdir(parents=True)
     locked = read_json(common.ROOT / "models.lock.json")
@@ -47,7 +48,7 @@ def failed_pair(work):
     atomic_json(root / "models.lock.json", locked)
     definition = {"student": "public", "models_lock_sha256": sha256(root / "models.lock.json"),
                   "restored_checkpoint_complete_sha256": None,
-                  "thresholds": {"teacher_r2": 25., "advantage": 1., "ci_lower": 0.},
+                   "thresholds": {"teacher_r2": teacher_minimum, "advantage": 1., "ci_lower": 0.},
                   "grid_work": str(work.parent / "grid")}
     atomic_json(work / "run.json", {"definition": definition})
     atomic_json(work / "native_runtime.json", RUNTIME)
@@ -99,15 +100,15 @@ def failed_pair(work):
         seal(role + "_validation", "validation", {
             "metrics.json": {"status": "complete", "n": VALIDATION_N, "split": "validation",
                              "precision": "bfloat16",
-                             "scores": {key: score for key in ("rouge1", "rouge2", "rougeL")},
+                              "scores": {key: score + metric_offsets.get(role, 0.)
+                                         for key in ("rouge1", "rouge2", "rougeL")},
                              "counts": {"empty_prediction": 0, "hit_generation_cap": 0}, "runtime": RUNTIME,
                              "predictions_sha256": hashlib.sha256(predictions.encode()).hexdigest()},
             "predictions.jsonl": predictions}, role=role, model_complete_sha256=hashes[role],
             data_complete_sha256=hashes["prepared"], protocol=PROTOCOL)
     seal("quality", "quality", {"report.json": {
-        "passed": False, "n": VALIDATION_N, "scores": {"teacher": 21., "student": 10.}, "advantage": 11.,
+        "passed": 21. >= teacher_minimum, "n": VALIDATION_N,
+        "scores": {"teacher": 21., "student": 10.}, "advantage": 11.,
         "paired_bootstrap_95ci": [10., 12.], "thresholds": definition["thresholds"]}},
         validation={role: hashes[role + "_validation"] for role in ("teacher", "student")})
-    seal("smoke", "smoke", {"report.json": {"passed": True}},
-         models={role: hashes[role] for role in ("student", "teacher")})
     return root, definition

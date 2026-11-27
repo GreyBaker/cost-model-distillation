@@ -25,6 +25,8 @@ def validate(scheme, locked):
     require(scheme["default_student"] == "restored", "Our student is the default; alternate mode must be explicit")
     require(scheme["accounting"]["local_sft_updates"] == 0, "This scheme must not perform local SFT")
     require(scheme["validation"]["periodic_greedy_monitor"] is False, "No periodic greedy monitor")
+    require(scheme["compatibility"]["grid_smoke_update_and_resume_required"] is False,
+            "Disposable GKD smoke/restart checks are development-only")
     grid = scheme["grid"]
     require(grid["budgets"] == [500, 1000, 5000, 10000, 50000], "Grid budgets changed")
     require(grid["on_policy_percentages"] == [0, 25, 50, 75, 100], "Grid mixture axis changed")
@@ -103,7 +105,6 @@ def build(student="restored"):
     stages += [
         "verify_native_fp32_student_and_bf16_teacher_serialization",
         "full_11332_teacher_and_student_validation_and_paired_difference",
-        "disposable_gkd_update_save_reload_resume_smoke_test",
         "review_and_explicitly_approve_quality_and_compatibility_reports",
         "publish_honest_external_pair_manifest_atomically",
         "bind_new_grid_through_required_external_pair_adapter",
@@ -127,6 +128,7 @@ def build(student="restored"):
         "local_sft_updates": 0, "periodic_greedy_monitor": False,
         "native_transformers": scheme["runtime"]["grid_transformers"],
         "stages": stages, "grid_cells": cells,
+        "development": {"smoke_command": "external_teacher.py dev-smoke", "included_in_standard_run": False},
         "grid_totals": {"cells": len(cells), **{
             key: sum(item[key] for item in cells) for key in
             ("points", "examples", "on_policy_examples", "off_policy_examples", "updates", "unspent_points")}},

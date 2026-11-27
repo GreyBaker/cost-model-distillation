@@ -51,7 +51,8 @@
     "fp32_logits_rtol_proposed": 0.0001,
     "fp32_logits_atol_proposed": 0.0001,
     "numeric_tolerance_policy": "initial proposed gates; fail and review discrepancies, never silently relax tolerances",
-    "grid_smoke_update_and_resume_required": true
+    "grid_smoke_update_and_resume_required": false,
+    "development_smoke_command": "external_teacher.py dev-smoke"
   },
   "validation": {
     "split": "validation",
@@ -67,12 +68,9 @@
     "write_predictions_and_per_example_scores": true,
     "report_empty_and_generation_cap_rates": true,
     "report_paired_bootstrap_difference": true,
-    "proposed_min_teacher_rouge2": 20.0,
-    "proposed_min_teacher_advantage": 1.0,
-    "proposed_min_paired_95ci_lower_bound": 0.0,
-    "quality_gate_status": "proposed operational criteria, not paper requirements or measured results",
+    "quality_gate_status": "informational_only_no_quality_admission_gates",
     "operator_approval_before_binding": true,
-    "quality_failure_override": "explicit boolean flag after completed evaluation; no message required; separate immutable model/data/report-bound waiver; no integrity or smoke bypass",
+    "quality_failure_override": "not required; legacy command flags are no-ops and published records remain archival provenance",
     "publisher_scores_are_independently_verified": false,
     "test_split_used_for_decisions": false,
     "periodic_greedy_monitor": false

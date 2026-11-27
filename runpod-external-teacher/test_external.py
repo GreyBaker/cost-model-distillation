@@ -42,7 +42,7 @@ def artifact(root, relative, expected, files, **metadata):
     return sha256(final / "COMPLETE.json")
 
 
-def fixture(work, mode="public", full_rows=True, thresholds=None):
+def fixture(work, mode="public", full_rows=True, thresholds=None, legacy_smoke=False):
     root = work / "pair"
     root.mkdir(parents=True)
     locked = read_json(common.ROOT / "models.lock.json")
@@ -65,7 +65,7 @@ def fixture(work, mode="public", full_rows=True, thresholds=None):
     atomic_json(work / "run.json", {"definition": definition})
     atomic_json(work / "native_runtime.json", RUNTIME)
     hashes = {}
-    names = pair.expected_artifacts(definition)
+    names = pair.expected_artifacts(definition, legacy_smoke=legacy_smoke)
     for label in (["teacher", "xsum", "public_student"] if mode == "public" else ["teacher", "xsum"]):
         spec = locked["evaluation_data"] if label == "xsum" else locked["models"][label]
         name = label + "_source"
@@ -132,18 +132,33 @@ def fixture(work, mode="public", full_rows=True, thresholds=None):
                                        and 10. > definition["thresholds"]["ci_lower"]),
                          "n": 11332, "scores": {"teacher": 21., "student": 10.},
                          "advantage": 11., "paired_bootstrap_95ci": [10., 12.], "thresholds": definition["thresholds"]}})
-    hashes["smoke"] = artifact(root, names["smoke"], pair.stage_identity(definition, "smoke",
-        models={role: hashes[role] for role in ("student", "teacher")}), {"report.json": {"passed": True}})
+    if legacy_smoke:
+        hashes["smoke"] = artifact(root, names["smoke"], pair.stage_identity(definition, "smoke",
+            models={role: hashes[role] for role in ("student", "teacher")}), {"report.json": {"passed": True}})
     manifest = {"kind": common.PAIR_KIND, "status": "complete", "definition": definition, "local_sft_updates": 0,
         "protocol": policy.PROTOCOL, "runtime": RUNTIME, "models_lock_sha256": definition["models_lock_sha256"],
         "artifacts": {key: {"path": relative, "complete_sha256": hashes[key]} for key, relative in names.items()},
         "approval": {"accepted": True, "definition_sha256": common.digest(definition),
-                     "quality_complete_sha256": hashes["quality"], "smoke_complete_sha256": hashes["smoke"]}}
+                      "quality_complete_sha256": hashes["quality"]}}
+    if legacy_smoke:
+        manifest["approval"]["smoke_complete_sha256"] = hashes["smoke"]
     atomic_json(root / "prepared_pair.json", manifest)
     return root, manifest
 
 
 class PairTests(unittest.TestCase):
+    def test_published_legacy_pair_preserves_archived_smoke_evidence_and_binding(self):
+        with tempfile.TemporaryDirectory() as d:
+            work = Path(d)
+            root, manifest = fixture(work, legacy_smoke=True)
+            before = tree_manifest(root)
+            with patch.object(pair, "environment", return_value=RUNTIME["environment"]):
+                original = inputs.inspect_pair(root, full=True)
+                resumed = pair.approve(work)
+            self.assertEqual(resumed, original)
+            self.assertEqual(tree_manifest(root), before)
+            self.assertIn("smoke_complete_sha256", manifest["approval"])
+
     def test_code_changes_record_provenance_but_do_not_rebind_or_block_resume(self):
         with tempfile.TemporaryDirectory() as d:
             root, _ = fixture(Path(d) / "work", full_rows=True)
@@ -293,11 +308,7 @@ class ControllerTests(unittest.TestCase):
                 patch.object(controller, "check_space"), patch.object(controller.Runner, "worker", worker), \
                 patch.object(controller.Runner, "call", call), patch.object(pair, "approve") as approval, \
                 contextlib.redirect_stdout(io.StringIO()):
-            if quality:
-                controller.run(args)
-            else:
-                with self.assertRaisesRegex(ValueError, "failed quality"):
-                    controller.run(args)
+            controller.run(args)
         return work, calls, batches, approval.call_count
 
     def test_default_pauses_before_pair_binding(self):
@@ -306,7 +317,8 @@ class ControllerTests(unittest.TestCase):
             self.assertEqual(read_json(work / "status.json")["phase"], "awaiting_pair_approval")
             self.assertEqual(approvals, 0)
             self.assertNotIn("grid-bind", calls)
-            self.assertEqual(calls[-1], "smoke")
+            self.assertEqual(calls[-1], "quality")
+            self.assertNotIn("smoke", calls)
             self.assertEqual(calls[:2], ["native-runtime", "acquire"])
 
     def test_pair_approval_runs_pilots_then_pauses_for_estimate(self):
@@ -323,12 +335,13 @@ class ControllerTests(unittest.TestCase):
                 self.assertEqual("grid-audit" in calls, not pause)
                 self.assertEqual(read_json(work / "status.json")["phase"], "paused" if pause else "complete")
 
-    def test_failed_quality_cannot_be_overridden_by_approval_flags(self):
+    def test_low_quality_is_informational_and_does_not_block_the_grid(self):
         with tempfile.TemporaryDirectory() as d:
-            _, calls, _, approvals = self.execute(Path(d), accept_pair=True, accept_grid=True, quality=False)
-            self.assertEqual(approvals, 0)
+            work, calls, _, approvals = self.execute(Path(d), accept_pair=True, accept_grid=True, quality=False)
+            self.assertEqual(approvals, 1)
             self.assertNotIn("smoke", calls)
-            self.assertFalse(any(name.startswith("grid-") for name in calls))
+            self.assertIn("grid-run", calls)
+            self.assertEqual(read_json(work / "status.json")["phase"], "complete")
 
     def test_validation_oom_halves_batch_in_a_fresh_attempt(self):
         with tempfile.TemporaryDirectory() as d:
@@ -567,12 +580,12 @@ class EvidenceTests(unittest.TestCase):
     def test_approval_requires_passed_sealed_reports_and_binds_their_hashes(self):
         with tempfile.TemporaryDirectory() as d:
             work = Path(d)
-            for stage in ("quality", "smoke"):
+            for stage in ("quality",):
                 artifact(work / "pair", "reports/" + stage, {"stage": stage},
                          {"report.json": {"passed": True}})
             reviewed = controller.reviewed_pair(work)
-            self.assertEqual(set(reviewed), {"quality", "smoke"})
-            (work / "pair/reports/smoke/report.json").write_text('{"passed":false}')
+            self.assertEqual(set(reviewed), {"quality"})
+            (work / "pair/reports/quality/report.json").write_text('{"passed":false}')
             with self.assertRaises(ValueError):
                 controller.reviewed_pair(work)
 
@@ -675,7 +688,7 @@ class EvaluationTests(unittest.TestCase):
             self.assertEqual(metrics["scores"]["rouge2"], 50.)
             self.assertEqual(metrics["rates"]["reference_over_cap"], 1.)
 
-    def test_quality_uses_paired_per_example_differences_and_frozen_thresholds(self):
+    def test_quality_reports_paired_per_example_differences_without_admission_thresholds(self):
         with tempfile.TemporaryDirectory() as d:
             work = Path(d)
             root, manifest = fixture(work)
@@ -688,8 +701,41 @@ class EvaluationTests(unittest.TestCase):
             self.assertEqual(len(diffs), 11332)
             self.assertEqual(set(diffs), {11.})
             report = read_json(root / "reports/quality/report.json")
-            self.assertTrue(report["passed"])
-            self.assertEqual(report["thresholds"], manifest["definition"]["thresholds"])
+            self.assertEqual(report["policy"], "informational-only")
+            self.assertNotIn("passed", report)
+            self.assertNotIn("thresholds", report)
+
+
+class DevelopmentTests(unittest.TestCase):
+    def test_smoke_is_explicit_development_command_and_never_updates_standard_status(self):
+        for passed in (True, False):
+            with self.subTest(passed=passed), tempfile.TemporaryDirectory() as d:
+                disk = Path(d).resolve()
+                work, grid = disk / "work", disk / "grid"
+                atomic_json(work / "run.json", {"definition": {"grid_work": str(grid)}})
+                atomic_json(work / "status.json", {"phase": "awaiting_pair_approval"})
+                before = {name: (work / name).read_bytes() for name in ("run.json", "status.json")}
+                calls = []
+                def worker(self, stage, python=None, batch=None):
+                    calls.append(stage)
+                    atomic_json(work / "pair/reports/smoke/report.json", {"passed": passed})
+                    return True
+                with patch.object(sys, "argv", ["external_teacher.py", "--pod-disk", str(disk),
+                        "--work-dir", str(work), "dev-smoke"]), \
+                        patch.object(controller, "operational_paths", return_value=(disk, work, grid)), \
+                        patch.object(controller, "configure_local_storage"), patch.object(controller, "runtime"), \
+                        patch.object(controller.Runner, "worker", worker), \
+                        patch.object(controller, "run", side_effect=AssertionError("Standard run must not start")), \
+                        patch.dict(os.environ, {}, clear=False), contextlib.redirect_stdout(io.StringIO()):
+                    if passed:
+                        external_teacher.main()
+                    else:
+                        with self.assertRaisesRegex(ValueError, "did not pass"):
+                            external_teacher.main()
+                self.assertEqual(calls, ["smoke"])
+                self.assertEqual(read_json(work / "development_smoke_status.json")["phase"],
+                                 "complete" if passed else "failed")
+                self.assertEqual(before, {name: (work / name).read_bytes() for name in before})
 
 
 class SmokeTests(unittest.TestCase):

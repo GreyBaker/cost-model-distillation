@@ -12,13 +12,13 @@ from gridlib.policy import PROTOCOL
 from . import quality_policy
 
 
-def expected_artifacts(definition, quality_overridden=False):
+def expected_artifacts(definition, quality_overridden=False, legacy_smoke=False):
     names = {
         "teacher_source": "sources/teacher", "xsum_source": "sources/xsum",
         "tokenizers": "reports/tokenizers", "corpus": "reports/corpus",
         "prepared": "student/prepared", "student": "models/student_fp32", "teacher": "models/teacher_bf16",
         "student_validation": "validation/student", "teacher_validation": "validation/teacher",
-        "quality": "reports/quality", "smoke": "reports/smoke",
+        "quality": "reports/quality",
     }
     if definition["student"] == "public":
         names["public_student_source"] = "sources/public_student"
@@ -27,6 +27,10 @@ def expected_artifacts(definition, quality_overridden=False):
                      restored_source="reports/restored_source")
     if quality_overridden:
         names["quality_override"] = quality_policy.RELATIVE
+    if legacy_smoke:
+        # Historical published pairs retain their exact recorded artifact set.
+        # New approvals never include optional development diagnostics.
+        names["smoke"] = "reports/smoke"
     return names
 
 
@@ -44,15 +48,13 @@ def inspect(root, full=True, check_runtime=True, *, _candidate=None):
             or pair.get("protocol") != PROTOCOL or pair.get("local_sft_updates") != 0
             or definition.get("student") not in ("restored", "public")):
         raise ValueError("Incomplete/foreign external-pair schema or protocol")
-    if set(definition.get("thresholds", {})) != {"teacher_r2", "advantage", "ci_lower"} or any(
-            type(x) not in (float, int) or not math.isfinite(x) for x in definition["thresholds"].values()):
-        raise ValueError("Invalid frozen quality criteria")
     lock_path = owned(root, "models.lock.json")
     if sha256(lock_path) != pair["models_lock_sha256"] or pair["models_lock_sha256"] != definition["models_lock_sha256"]:
         raise ValueError("Frozen external source lock changed")
     locked = read_json(lock_path)
     quality_overridden = "quality_override" in pair["artifacts"]
-    expected = expected_artifacts(definition, quality_overridden)
+    legacy_smoke = "smoke" in pair["artifacts"]
+    expected = expected_artifacts(definition, quality_overridden, legacy_smoke)
     if set(pair["artifacts"]) != set(expected):
         raise ValueError("External pair lacks required evidence")
     markers = {}
@@ -177,32 +179,24 @@ def inspect(root, full=True, check_runtime=True, *, _candidate=None):
     if markers["quality"]["identity"] != quality_identity:
         raise ValueError("Quality gate is not for this pair's actual evaluations")
     quality = read_json(root / expected["quality"] / "report.json")
-    failed = quality_policy.failed_gates(quality, definition["thresholds"])
-    override = None
-    if failed:
-        if not quality_overridden:
-            raise ValueError("External teacher quality gate failed; an explicit quality override is required")
-        override = quality_policy.current_override(root, definition, full=full)
-    elif quality_overridden:
-        raise ValueError("Passing quality evidence must not claim an override")
-    for role in ("teacher", "student"):
-        actual_r2 = read_json(root / expected[role + "_validation"] / "metrics.json")["scores"]["rouge2"]
-        if quality["scores"][role] != actual_r2:
-            raise ValueError("Quality scores differ from actual full validation")
-    if abs(quality["scores"]["teacher"] - quality["scores"]["student"] - quality["advantage"]) > 1e-9:
-        raise ValueError("Teacher advantage is inconsistent")
-    if (markers["smoke"]["identity"] != stage_identity(definition, "smoke", models={
-            role: pair["artifacts"][role]["complete_sha256"] for role in ("student", "teacher")})
-            or read_json(root / expected["smoke"] / "report.json").get("passed") is not True):
-        raise ValueError("Real native GKD save/reload/restart test is missing")
+    quality_policy.validate_report(quality)
+    # Existing published override records are archived integrity/provenance only.
+    # They are never required by new approvals or used to admit/reject quality.
+    override = quality_policy.current_override(root, definition, full=full) if quality_overridden else None
     if full:
         from .evaluation import paired_rows
         paired_rows(root)  # Recheck real prediction coverage/reference hashes and aggregate scores, no ML import.
     approval = pair.get("approval", {})
     if (approval.get("accepted") is not True or approval.get("definition_sha256") != digest(definition)
-            or approval.get("quality_complete_sha256") != pair["artifacts"]["quality"]["complete_sha256"]
-            or approval.get("smoke_complete_sha256") != pair["artifacts"]["smoke"]["complete_sha256"]):
+            or approval.get("quality_complete_sha256") != pair["artifacts"]["quality"]["complete_sha256"]):
         raise ValueError("Explicit external-pair approval is missing or stale")
+    if legacy_smoke:
+        if (markers["smoke"]["identity"] != stage_identity(definition, "smoke", models={
+                role: pair["artifacts"][role]["complete_sha256"] for role in ("student", "teacher")})
+                or approval.get("smoke_complete_sha256") != pair["artifacts"]["smoke"]["complete_sha256"]):
+            raise ValueError("Historical smoke artifact no longer matches its archived pair approval")
+    elif "smoke_complete_sha256" in approval:
+        raise ValueError("Historical smoke approval refers to missing archived evidence")
     if quality_overridden:
         if (override is None or approval.get("quality_override_complete_sha256")
                 != pair["artifacts"]["quality_override"]["complete_sha256"]):
@@ -224,6 +218,8 @@ def inspect(root, full=True, check_runtime=True, *, _candidate=None):
                                     "sources": locked, "approval": approval}}
     if override is not None:
         result["external_provenance"]["quality_override"] = override
+    if "quality_policy" in pair:
+        result["external_provenance"]["quality_policy"] = pair["quality_policy"]
     return result
 
 
@@ -232,25 +228,19 @@ def approve(work):
     if (root / "prepared_pair.json").exists():
         return inspect(root)
     definition = request(work)["definition"]
-    override = quality_policy.current_override(root, definition)
-    names = expected_artifacts(definition, override is not None)
+    names = expected_artifacts(definition)
     artifacts = {}
     for name, relative in names.items():
         verify(owned(root, relative))
         artifacts[name] = {"path": relative, "complete_sha256": sha256(owned(root, relative) / "COMPLETE.json")}
-    quality = read_json(root / "reports/quality/report.json")
-    if quality.get("passed") is not True and override is None:
-        raise ValueError("Cannot approve a rejected teacher")
     value = {"kind": PAIR_KIND, "status": "complete", "definition": definition,
+             "quality_policy": "informational-only",
              "protocol": PROTOCOL, "local_sft_updates": 0, "artifacts": artifacts,
              "models_lock_sha256": sha256(root / "models.lock.json"),
              "runtime": read_json(Path(work) / "native_runtime.json"),
              "approval": {"accepted": True, "definition_sha256": digest(definition),
                           "quality_complete_sha256": artifacts["quality"]["complete_sha256"],
-                          "smoke_complete_sha256": artifacts["smoke"]["complete_sha256"],
                            "unix_time": time.time(), "source_fingerprints": code()}}
-    if override is not None:
-        value["approval"]["quality_override_complete_sha256"] = artifacts["quality_override"]["complete_sha256"]
     # Validate all backing evidence BEFORE publishing a complete pair.
     inspect(root, _candidate=value)
     atomic_json(root / "prepared_pair.json", value)

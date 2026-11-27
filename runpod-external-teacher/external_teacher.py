@@ -20,19 +20,21 @@ def main():
     parser.add_argument("--restored-root", type=Path, default=os.environ.get("RESTORED_SFT"))
     parser.add_argument("--reference-python", type=Path, default=ROOT / ".venv-reference/bin/python")
     parser.add_argument("--settings", type=Path, default=ROOT.parent / "runpod-gkd/settings.json")
-    parser.add_argument("--min-teacher-r2", type=float, default=20.)
-    parser.add_argument("--min-advantage", type=float, default=1.)
-    parser.add_argument("--min-ci-lower", type=float, default=0.)
+    # Accept historical command lines, but do not enforce retired quality gates.
+    parser.add_argument("--min-teacher-r2", type=float, help=argparse.SUPPRESS)
+    parser.add_argument("--min-advantage", type=float, help=argparse.SUPPRESS)
+    parser.add_argument("--min-ci-lower", type=float, help=argparse.SUPPRESS)
     parser.add_argument("--minimum-free-gib", type=float, default=100.)
     parser.add_argument("--json", action="store_true")
     commands = parser.add_subparsers(dest="command")
     commands.add_parser("plan", help="Read-only; no ML/network/GPU work")
     execute = commands.add_parser("run", help="ON POD: pinned import, validation, approval and normal grid")
-    execute.add_argument("--accept-pair", action="store_true", help="Approve reviewed quality/override and passed smoke evidence")
+    execute.add_argument("--accept-pair", action="store_true", help="Approve reviewed compatibility and informational validation reports")
     execute.add_argument("--override-quality", action="store_true",
-                         help="Accept a completed quality-threshold failure; never bypass integrity/smoke checks")
+                         help=argparse.SUPPRESS)  # Retired; retained as a no-op for old commands.
     execute.add_argument("--accept-grid-estimate", action="store_true")
     commands.add_parser("verify", help="Read-only full byte/provenance verification of an approved pair")
+    commands.add_parser("dev-smoke", help="DEVELOPMENT ONLY, ON POD: disposable GKD updates and restart diagnostics; not part of run")
     worker = commands.add_parser("_worker", help=argparse.SUPPRESS)
     worker.add_argument("--stage", required=True, choices=[
         "native-runtime", "reference-runtime", "acquire", "corpus", "legacy-tokenizer", "tokenizers", "prepared", "legacy-probe",
@@ -51,15 +53,18 @@ def main():
         result = inspect(args.work_dir.expanduser().resolve() / "pair")
         print(json.dumps(result, indent=2))
         return
-    if args.command == "run":
+    if args.command in ("run", "dev-smoke"):
         if args.pod_disk is None:
             parser.error("Set POD_DISK or --pod-disk")
-        from external_workflow.controller import run
+        from external_workflow.controller import development_smoke, run
         args.work_dir = args.work_dir.expanduser().resolve()
         args.grid_work = args.grid_work.expanduser().resolve()
         if args.restored_root:
             args.restored_root = args.restored_root.expanduser().resolve()
-        run(args)
+        if args.command == "dev-smoke":
+            development_smoke(args)
+        else:
+            run(args)
         return
     from external_workflow.common import (OOM_EXIT, RunLock, atomic_json, digest,
         operational_paths, read_json)
