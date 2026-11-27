@@ -42,6 +42,8 @@ def main():
         display({**policy.plan(), "settings": settings}, "Point-budget GKD plan", args.json)
         return
     root, sft_work = args.work_dir.resolve(), args.sft_work.resolve()
+    from gridlib import schedule
+    schedule.validate_root(root, allow_new=operation == "bind")
     if operation == "summary":
         from gridlib.reporting import summary
         if not root.is_dir():
@@ -68,12 +70,8 @@ def main():
             print("Verified validated external pair; no model loaded or GPU used."
                   if bound["inputs"].get("kind") == "validated-external-pair-v1"
                   else "Verified completed 100K/8K SFT pair; no model loaded or GPU used.")
-            if "training_design" in bound:
-                print("Continuous design: five mixtures, 2,560,000 nominal points each; "
-                      "45 retained/evaluated milestones, rolling recovery every 5,000 points.")
-            else:
-                print("Existing LEGACY independent-budget grid preserved. Use a NEW grid work directory "
-                      "to adopt continuous trajectories; never edit the old binding.")
+            print("Continuous design: five mixtures, 2,560,000 nominal points each; "
+                  "45 retained/evaluated milestones, rolling recovery every 5,000 points.")
         elif operation == "audit":
             from gridlib.audit import audit
             result = audit(root, bound)
@@ -117,9 +115,7 @@ def main():
             from gridlib.controller import saved_pilot
             from gridlib.recovery import (OOM_EXIT_CODE, evaluation_microbatch, training_microbatch)
             selected = saved_pilot(root)
-            from gridlib import schedule
-            candidates = (schedule.trajectories() if operation == "_train" else schedule.milestones()) \
-                if schedule.enabled(bound) else policy.cells()
+            candidates = schedule.trajectories() if operation == "_train" else schedule.milestones()
             item = next((x for x in candidates if x["id"] == args.cell), None)
             if item is None and not (operation == "_evaluate" and args.cell == "baseline"):
                 raise ValueError("Explicit grid cell required")

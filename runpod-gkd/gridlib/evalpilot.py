@@ -7,23 +7,14 @@ import time
 import uuid
 
 from .policy import PROTOCOL, VALIDATION_N
+from .schedule import require_design, validate_root
 from .shared import atomic_json, read_json, sha256, verify_tree
 from sftlib.console import message, progress
 
 
-def request(root, bound, selected, version=None):
-    if version is None:
-        # Published/unfinished historical calibrations retain their original
-        # policy. Updating source code must never force recalibration/rebinding.
-        if (root / "evaluation_pilot.json").exists():
-            version = read_json(root / "evaluation_pilot.json")["request"]["version"]
-        elif (root / "evaluation_pilot_request.json").exists():
-            version = read_json(root / "evaluation_pilot_request.json")["version"]
-        else:
-            version = 2
-    if type(version) is not int or version not in (1, 2):
-        raise ValueError("Unsupported evaluation-pilot policy version")
-    result = {"version": version, "binding_sha256": sha256(root / "binding.json"),
+def request(root, bound, selected):
+    require_design(bound)
+    result = {"version": 2, "binding_sha256": sha256(root / "binding.json"),
             # Current binding() return, NOT binding.json's original code record.
             # Conservative superset of inference sources; provenance, never a gate.
             "source_fingerprints": bound.get("code", {}),
@@ -37,9 +28,8 @@ def request(root, bound, selected, version=None):
             "stress": {"source_tokens": 1024, "generation_tokens": 64,
                        "precision": "bfloat16", "sample": False, "force_cap": True,
                         "teacher_loaded": False}}
-    if version == 2:
-        result.update(selection_policy="warmed-stress-throughput-v1",
-                      throughput_near_best_fraction=.98)
+    result.update(selection_policy="warmed-stress-throughput-v1",
+                  throughput_near_best_fraction=.98)
     return result
 
 
@@ -177,6 +167,7 @@ def verify_trial(result, expected, batch):
 
 def saved(root, bound, selected):
     """Validate the complete deterministic transcript, without launching probes."""
+    validate_root(root)
     try:
         return _saved(root, bound, selected)
     except (AttributeError, KeyError, TypeError, OSError, RuntimeError) as error:
@@ -207,12 +198,8 @@ def _saved(root, bound, selected):
         visited.add(batch)
         return trials[batch]
 
-    details = {}
-    if expected["version"] == 1:
-        maximum, batch = select_batch(replay, expected)
-    else:
-        maximum, batch, details = select_throughput(
-            replay, expected, lambda size: warmed_throughput(results[size], size))
+    maximum, batch, details = select_throughput(
+        replay, expected, lambda size: warmed_throughput(results[size], size))
     if (type(value["max_passing_batch"]) is not int or value["max_passing_batch"] != maximum
             or type(value["batch_size"]) is not int or value["batch_size"] != batch
             or type(value.get("search_cap_reached")) is not bool
@@ -225,6 +212,8 @@ def _saved(root, bound, selected):
 
 def ensure(root, bound, selected, runner):
     """Publish one immutable calibration, resume only unfinished candidate search."""
+    require_design(bound)
+    validate_root(root)
     if (root / "evaluation_pilot.json").exists():
         result = saved(root, bound, selected)
         original_request = (read_json(root / "evaluation_pilot_request.json")
@@ -235,18 +224,13 @@ def ensure(root, bound, selected, runner):
         message(f"Reusing evaluation pilot: batch {result['batch_size']} "
                 f"(max passing {result['max_passing_batch']}).")
         return True
-    # Do not change the identity of completed historical evaluations in place.
-    legacy = list((root / "baseline").glob("evaluation*/COMPLETE.json"))
-    legacy += list((root / "cells").glob("*/evaluation*/COMPLETE.json"))
-    if legacy:
-        raise ValueError("Completed legacy evaluations have no evaluation pilot; preserve them and use a new grid directory")
-    # Recovery identity gains the pilot hash. Refuse BEFORE publishing a request
-    # or spending on probes rather than stranding an incomplete legacy run later.
-    legacy_batching = list((root / "baseline").glob("evaluation_batching.json"))
-    legacy_batching += list((root / "cells").glob("*/evaluation_batching.json"))
-    if legacy_batching:
-        raise ValueError(f"Legacy evaluation recovery state at {legacy_batching[0]}; "
-                         "preserve the old grid and use a new grid directory for calibration")
+    # Existing evaluation/recovery artifacts must retain their original pilot.
+    artifacts = list((root / "baseline").glob("evaluation*/COMPLETE.json"))
+    artifacts += list((root / "milestones").glob("*/evaluation*/COMPLETE.json"))
+    artifacts += list((root / "baseline").glob("evaluation_batching.json"))
+    artifacts += list((root / "milestones").glob("*/evaluation_batching.json"))
+    if artifacts:
+        raise ValueError("Evaluation artifacts have no matching pilot; preserve them and use a NEW grid directory.")
     expected = request(root, bound, selected)
     request_path = root / "evaluation_pilot_request.json"
     if (request_path.exists()
@@ -260,9 +244,7 @@ def ensure(root, bound, selected, runner):
     record_provenance(root, expected, cached_requests, "search_start_or_resume")
     # Exponential + binary search plus halving safety chain. The powers in the
     # throughput sweep are already capacity probes; at most three quarters add work.
-    probe_bound = 3 * math.ceil(math.log2(expected["search_cap"] + 1)) + 2
-    if expected["version"] == 2:
-        probe_bound += 3
+    probe_bound = 3 * math.ceil(math.log2(expected["search_cap"] + 1)) + 5
     message(f"Evaluation calibration: at most {probe_bound} distinct candidate subprocesses "
             f"({probe_bound * expected['repeats']} full 1024/forced-64 stress repetitions). "
             "Cached candidates cost no generation; each fresh process loads the student, "
@@ -281,21 +263,15 @@ def ensure(root, bound, selected, runner):
         return passed
 
     try:
-        details = {}
-        if expected["version"] == 1:
-            maximum, batch = select_batch(probe, expected)
-        else:
-            maximum, batch, details = select_throughput(
-                probe, expected, lambda size: warmed_throughput(results[size], size))
+        maximum, batch, details = select_throughput(
+            probe, expected, lambda size: warmed_throughput(results[size], size))
     except InterruptedError:
         return False
     atomic_json(root / "evaluation_pilot.json", {
         "request": expected, "max_passing_batch": maximum, "batch_size": batch,
         "search_cap_reached": maximum == expected["search_cap"],
         **details,
-        "selection": ("largest measured stress-fit batch with reserved headroom, then batch safety fraction"
-                      if expected["version"] == 1 else
-                      "smallest measured batch within 2% of best warmed throughput, below tested safety ceiling"),
+        "selection": "smallest measured batch within 2% of best warmed throughput, below tested safety ceiling",
         "limitation": "Bounded stress-workload sweep, not an exhaustive real-pool throughput optimum; "
                       "later checkpoint OOMs retain bounded fallback",
         "result_files": [files[k] for k in sorted(files)]})

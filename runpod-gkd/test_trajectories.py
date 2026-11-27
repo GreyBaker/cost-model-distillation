@@ -20,6 +20,7 @@ from gridlib import (backend, controller, engine, evaluation, inputs, milestones
 from gridlib.shared import atomic_json, checkpoints, read_json, sha256, tree_manifest
 from sftlib import training
 import distill_grid
+import run_pipeline
 
 
 class Model:
@@ -53,6 +54,7 @@ def fake_training(root):
     selected = {"microbatch": 32, "runtime": {"mock": True}}
     atomic_json(root / "binding.json", bound)
     atomic_json(root / "pilot.json", {"mock": True})
+    atomic_json(root / "evaluation_pilot.json", {"mock": True, "batch_size": 32})
     generator = random.Random()
     calls, loads = [], []
     tokenizer = SimpleNamespace(save_pretrained=lambda path: (path / "tokenizer.json").write_text("{}"))
@@ -81,6 +83,7 @@ def fake_training(root):
             patch.object(training, "seed", generator.seed), \
             patch.object(training, "rng_state", generator.getstate), \
             patch.object(training, "restore_rng", generator.setstate), \
+            patch("gridlib.evalpilot.saved", return_value={"batch_size": 32}), \
             contextlib.redirect_stdout(io.StringIO()):
         yield bound, selected, calls, loads
 
@@ -116,7 +119,7 @@ class ScheduleTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             schedule.milestone(50, 5000)
 
-    def test_new_bindings_select_design_and_legacy_bindings_are_not_upgraded(self):
+    def test_new_bindings_select_design_and_old_bindings_are_rejected_untouched(self):
         with tempfile.TemporaryDirectory() as d:
             root = Path(d) / "grid"
             with patch.object(inputs, "separate_work"), patch.object(inputs, "inspect_pair", return_value={"fixed": True}), \
@@ -127,8 +130,81 @@ class ScheduleTests(unittest.TestCase):
                 original.pop("training_design")
                 atomic_json(root / "binding.json", original)
                 before = (root / "binding.json").read_bytes()
-                self.assertNotIn("training_design", inputs.binding(root, Path(d) / "pair", policy.settings()))
+                with self.assertRaisesRegex(ValueError, "NEW grid directory"):
+                    inputs.binding(root, Path(d) / "pair", policy.settings())
                 self.assertEqual((root / "binding.json").read_bytes(), before)
+
+    def test_obsolete_grid_is_rejected_by_every_operational_cli_before_any_writes(self):
+        operations = [
+            ["bind"], ["pilot"], ["estimate"], ["summary"], ["audit"],
+            ["run"], ["run", "--accept-estimate"], ["_runtime"],
+            ["_pilot"], ["_evaluation_pilot"],
+            ["_train", "--cell", "p05000_on000"], ["_evaluate", "--cell", "p05000_on000"],
+        ]
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            atomic_json(root / "binding.json", {"protocol":policy.PROTOCOL, "settings":policy.settings()})
+            atomic_json(root / "status.json", {"status":"complete", "complete_cells":25})
+            (root / "summary.csv").write_text("archived results\n")
+            before = tree_manifest(root)
+            for operation in operations:
+                with self.subTest(operation=operation), patch.object(sys, "argv", [
+                        "distill_grid.py", "--work-dir", str(root), *operation]), \
+                        patch("sftlib.core.configure_local_storage",
+                              side_effect=AssertionError("No cache/environment writes allowed")), \
+                        self.assertRaisesRegex(ValueError, "NEW grid directory"):
+                    distill_grid.main()
+                self.assertEqual(tree_manifest(root), before)
+            with self.assertRaisesRegex(ValueError, "NEW grid directory"):
+                reporting.summary(root)
+            with self.assertRaisesRegex(ValueError, "NEW grid directory"):
+                reporting.estimate(root, {}, {})
+            self.assertEqual(tree_manifest(root), before)
+
+    def test_old_cell_api_settings_and_unbound_directory_adoption_are_removed(self):
+        self.assertFalse(hasattr(policy, "cell"))
+        self.assertFalse(hasattr(policy, "cells"))
+        self.assertFalse(hasattr(policy, "legacy_plan"))
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            old = {"id":"p05000_on000", "on_policy_percent":0, "budget_points":5000, "updates":157}
+            with self.assertRaises(ValueError):
+                policy.update_spec(old, 0)
+            with self.assertRaises(ValueError):
+                engine.train(root, {"training_design":schedule.DESIGN}, old, {})
+            with self.assertRaises(ValueError):
+                evaluation.source(root, {"training_design":schedule.DESIGN}, old)
+            atomic_json(root / "old-settings.json", {**policy.settings(), "save_every_updates":50})
+            with self.assertRaisesRegex(ValueError, "settings fields"):
+                policy.settings(root / "old-settings.json")
+            before = tree_manifest(root)
+            with self.assertRaisesRegex(ValueError, "NEW grid directory"):
+                schedule.validate_root(root, allow_new=True)
+            self.assertEqual(tree_manifest(root), before)
+
+    def test_outer_controllers_reject_old_grid_before_storage_or_workers(self):
+        sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "runpod-external-teacher"))
+        from external_workflow import controller as external_controller
+        with tempfile.TemporaryDirectory() as d:
+            disk = Path(d)
+            work, grid = disk / "external", disk / "old-grid"
+            atomic_json(grid / "binding.json", {"old_grid":True})
+            before = tree_manifest(disk)
+            forbidden = AssertionError("No setup/runtime/worker calls for an unsupported grid")
+            args = SimpleNamespace(pod_disk=disk, work_dir=work, grid_work=grid, student="public")
+            with patch.object(external_controller, "operational_paths", return_value=(disk, work, grid)), \
+                    patch.object(external_controller, "configure_local_storage", side_effect=forbidden), \
+                    patch.object(external_controller, "runtime", side_effect=forbidden), \
+                    self.assertRaisesRegex(ValueError, "NEW grid directory"):
+                external_controller.run(args)
+            with patch.object(run_pipeline, "ROOT", disk / "code/runpod-gkd"), \
+                    patch.object(run_pipeline, "SFT_CODE", disk / "code/runpod-sft"), \
+                    patch.dict("os.environ", {"SFT_WORK":str(disk / "sft"), "GKD_WORK":str(grid)}), \
+                    patch.object(run_pipeline, "configure_local_storage", side_effect=forbidden), \
+                    patch.object(run_pipeline, "invoke", side_effect=forbidden), \
+                    self.assertRaisesRegex(ValueError, "NEW grid directory"):
+                run_pipeline.run(disk, reuse_sft=True)
+            self.assertEqual(tree_manifest(disk), before)
 
 
 class TrainingTests(unittest.TestCase):
@@ -305,11 +381,13 @@ class OrchestrationTests(unittest.TestCase):
                     patch.object(controller, "ensure_evaluation", evaluate), \
                     patch.object(reporting, "summary", return_value=summary), \
                     contextlib.redirect_stdout(io.StringIO()):
-                controller.run_trajectories(root, {}, {}, None, SimpleNamespace(requested=False))
+                controller.run_trajectories(root, {"training_design":schedule.DESIGN}, {}, None,
+                                            SimpleNamespace(requested=False))
                 self.assertEqual(len(trained), 45)
                 self.assertEqual(len({x[0] for x in trained}), 5)
                 self.assertEqual(evaluated, {x["id"] for x in schedule.milestones()})
-                controller.run_trajectories(root, {}, {}, None, SimpleNamespace(requested=False))
+                controller.run_trajectories(root, {"training_design":schedule.DESIGN}, {}, None,
+                                            SimpleNamespace(requested=False))
                 self.assertEqual(len(trained), 45)
                 self.assertEqual(read_json(root / "status.json")["status"], "complete")
 

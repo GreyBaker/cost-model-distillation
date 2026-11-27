@@ -1,7 +1,4 @@
-"""Continuous, independently initialized mixtures with immutable point milestones.
-
-Legacy independent-budget grids remain readable/resumable without this design.
-"""
+"""The only supported grid: continuous mixtures with immutable point milestones."""
 from __future__ import annotations
 
 from bisect import bisect_left
@@ -26,11 +23,28 @@ DESIGN = {
 }
 
 
-def enabled(bound):
-    design = bound.get("training_design")
-    if design is not None and design != DESIGN:
-        raise ValueError("Unknown/changed continuous training design")
-    return design is not None
+def require_design(bound):
+    if bound.get("training_design") != DESIGN:
+        raise ValueError("Unsupported grid design. Only continuous-point-milestones-v1 is supported; "
+                         "preserve old results and use a NEW grid directory.")
+
+
+def validate_root(root, *, allow_new=False):
+    """Reject obsolete/unowned work before creating locks, caches or status files."""
+    from .shared import read_json
+    path = root / "binding.json"
+    if path.is_file():
+        bound = read_json(path)
+        require_design(bound)
+        if (root / "cells").exists():
+            raise ValueError("Old independent-cell grid directories are unsupported; use a NEW grid directory.")
+        return bound
+    if not allow_new:
+        raise ValueError("No continuous grid binding; use a NEW grid directory and run bind.")
+    if root.exists() and any(entry.name not in (".controller.lock", ".worker.lock")
+                             for entry in root.iterdir()):
+        raise ValueError("Nonempty grid directory without a continuous binding; use a NEW grid directory.")
+    return None
 
 
 @lru_cache(maxsize=5)
@@ -68,6 +82,16 @@ def trajectory(percent):
 
 def trajectories():
     return [trajectory(percent) for percent in PERCENTAGES]
+
+
+def require_trajectory(item):
+    if item != trajectory(item.get("on_policy_percent", -1)):
+        raise ValueError("Only a declared full continuous trajectory may be trained.")
+
+
+def require_milestone(item):
+    if item != milestone(item.get("on_policy_percent", -1), item.get("budget_points")):
+        raise ValueError("Only a declared continuous milestone may be evaluated.")
 
 
 def groups_after(item, step):
@@ -122,13 +146,15 @@ def milestones():
 
 
 def training_directory(root, item):
-    return root / ("trajectories" if "training_design" in item else "cells") / item["id"]
+    require_trajectory(item)
+    return root / "trajectories" / item["id"]
 
 
 def evaluation_directory(root, item):
     if item is None:
         return root / "baseline"
-    return root / ("milestones" if "trajectory_id" in item else "cells") / item["id"]
+    require_milestone(item)
+    return root / "milestones" / item["id"]
 
 
 def plan():

@@ -17,7 +17,7 @@ class CudaOOM(RuntimeError):
 def identity(root, evaluation=False):
     value = {"binding_sha256": sha256(root / "binding.json"),
              "pilot_sha256": sha256(root / "pilot.json")}
-    if evaluation and (root / "evaluation_pilot.json").exists():
+    if evaluation:
         value["evaluation_pilot_sha256"] = sha256(root / "evaluation_pilot.json")
     return value
 
@@ -44,11 +44,8 @@ def evaluation_path(root, item):
 
 
 def evaluation_initial(root, bound, selected):
-    if (root / "evaluation_pilot.json").exists():
-        from .evalpilot import saved
-        return saved(root, bound, selected)["batch_size"]
-    # Legacy identity/audit compatibility only. New workers require calibration.
-    return min(selected["microbatch"], bound["settings"]["evaluation_batch_cap"])
+    from .evalpilot import saved
+    return saved(root, bound, selected)["batch_size"]
 
 
 def evaluation_microbatch(root, bound, item, selected):

@@ -28,8 +28,8 @@
     "pod_copy": "<POD_DISK>/restored-sft/student/",
     "pair_root": "<POD_DISK>/external-xsum-work/pair/",
     "grid_root": "<POD_DISK>/external-xsum-grid/",
-    "native_venv": "<POD_DISK>/cs395t-fga/runpod-external-teacher/.venv-native",
-    "legacy_reference_venv": "<POD_DISK>/cs395t-fga/runpod-external-teacher/.venv-reference"
+    "native_venv": "<POD_DISK>/cost-model-distillation/runpod-external-teacher/.venv-native",
+    "legacy_reference_venv": "<POD_DISK>/cost-model-distillation/runpod-external-teacher/.venv-reference"
   },
   "compatibility": {
     "source_hashes_required": true,

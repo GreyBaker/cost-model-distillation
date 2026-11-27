@@ -11,6 +11,8 @@ from .shared import (atomic_json, checkpoints, check_space, read_json, sha256,
 
 
 def verify(root, bound, item, selected):
+    schedule.require_design(bound)
+    schedule.require_milestone(item)
     from .engine import check_state
     from .controller import training_config
     run_dir = root / "trajectories" / item["trajectory_id"]
@@ -42,6 +44,8 @@ def verify(root, bound, item, selected):
 
 def retain(root, bound, trajectory, selected, checkpoint, state):
     """Called before advancing beyond a recovery boundary; safe to retry on resume."""
+    schedule.require_design(bound)
+    schedule.require_trajectory(trajectory)
     matches = [item for item in schedule.milestones()
                if item["trajectory_id"] == trajectory["id"] and item["updates"] == state["step"]]
     if not matches:

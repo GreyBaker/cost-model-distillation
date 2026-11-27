@@ -9,6 +9,7 @@ from .shared import read_json, sha256
 
 
 def estimate(root, selected, settings):
+    schedule.validate_root(root)
     from .evaluation import verify
     from .policy import VALIDATION_N
     from .recovery import training_microbatch
@@ -57,10 +58,8 @@ def estimate(root, selected, settings):
         "training_design": schedule.DESIGN, "trajectories": rows,
         "pilot_sha256": sha256(root / "pilot.json"),
         "pilot_microbatch": mb, "active_training_microbatch": active,
-        "evaluation_pilot_batch": (read_json(root / "evaluation_pilot.json")["batch_size"]
-                                   if (root / "evaluation_pilot.json").exists() else None),
-        "evaluation_pilot_sha256": (sha256(root / "evaluation_pilot.json")
-                                   if (root / "evaluation_pilot.json").exists() else None),
+        "evaluation_pilot_batch": read_json(root / "evaluation_pilot.json")["batch_size"],
+        "evaluation_pilot_sha256": sha256(root / "evaluation_pilot.json"),
         "forecast_stale_after_oom": active != mb,
         "training_hours": sum(row["estimated_training_seconds"] for row in rows) / 3600,
         "evaluation_hours": sum(row["estimated_evaluation_seconds"] for row in rows) / 3600,

@@ -131,6 +131,8 @@ def run(args):
     disk, work, grid = operational_paths(args.pod_disk, args.work_dir, args.grid_work,
         args.restored_root if args.student == "restored" else None,
         args.reference_python if args.student == "restored" else None)
+    from gridlib.schedule import validate_root
+    validate_root(grid, allow_new=True)
     os.environ["POD_DISK"] = str(disk)
     from plan import validate
     validate(read_json(ROOT / "scheme.json"), read_json(ROOT / "models.lock.json"))

@@ -1,18 +1,15 @@
 """Serial Pod orchestration; no model imports in plans/estimates/reports."""
 from __future__ import annotations
 
-import json
-import os
 from pathlib import Path
-import subprocess
 import sys
 import time
 import uuid
 
 from . import evaluation, reporting
-from .policy import ROOT, cells
-from .shared import atomic_json, checkpoints, read_json, sha256
-from .engine import append, check_state
+from .policy import ROOT
+from .shared import atomic_json, read_json, sha256
+from .engine import append
 from .recovery import (CudaOOM, OOM_EXIT_CODE, evaluation_microbatch, evaluation_path,
                         evaluation_initial, lower, train_with_recovery)
 from . import evalpilot
@@ -71,6 +68,7 @@ class Runner:
 
 
 def saved_pilot(root):
+    schedule.validate_root(root)
     pilot = read_json(root / "pilot.json")
     if pilot["binding_sha256"] != sha256(root / "binding.json"):
         raise ValueError("Saved pilot belongs to different inputs/settings/code")
@@ -81,16 +79,13 @@ def saved_pilot(root):
 
 
 def ensure_evaluation(root, bound, item, selected, runner):
+    schedule.require_design(bound)
     while True:
         try:
             return evaluation_attempt(root, bound, item, selected, runner)
         except CudaOOM as error:
             if item is not None:
-                if "trajectory_id" in item:
-                    evaluation.source(root, bound, item)
-                else:
-                    from .recovery import checkpoint_for_retry
-                    checkpoint_for_retry(root, item)
+                evaluation.source(root, bound, item)
             initial = evaluation_initial(root, bound, selected)
             lower(root, evaluation_path(root, item), initial,
                   evaluation_microbatch(root, bound, item, selected),
@@ -98,6 +93,7 @@ def ensure_evaluation(root, bound, item, selected, runner):
 
 
 def evaluation_attempt(root, bound, item, selected, runner):
+    schedule.require_design(bound)
     owner = schedule.evaluation_directory(root, item)
     owner.mkdir(parents=True, exist_ok=True)
     pointer = owner / "latest_evaluation.json"
@@ -130,36 +126,16 @@ def training_config(bound, item, selected):
 
 
 def check_completed_training(root, bound, item, selected):
-    if "trajectory_id" in item:
-        from .milestones import verify
-        if not (schedule.evaluation_directory(root, item) / "snapshot.json").exists():
-            return False
-        verify(root, bound, item, selected)
-        return True
-    run_dir = root / "cells" / item["id"]
-    path = run_dir / "training_summary.json"
-    if not path.exists():
+    from .milestones import verify
+    schedule.require_design(bound)
+    if not (schedule.evaluation_directory(root, item) / "snapshot.json").exists():
         return False
-    result = read_json(path)
-    if result.get("status") != "complete":
-        return False
-    run = read_json(run_dir / "run.json")
-    if (result["cell"] != item or run["config"] != training_config(bound, item, selected)
-            or run["signatures"] != {"binding_sha256": sha256(root / "binding.json"),
-                                      "pilot_sha256": sha256(root / "pilot.json")}
-            or run["initial_student"] != bound["inputs"]["paths"]["student_checkpoint"]):
-        raise ValueError("Completed cell provenance/configuration changed")
-    check_state(result, item)
-    if result["step"] != item["updates"]:
-        raise ValueError("Completed cell has incorrect update count")
-    checkpoint = checkpoints.resolve(run_dir)
-    marker = checkpoints.verify(checkpoint, run["run_id"])
-    if str(checkpoint) != result["checkpoint"] or marker["step"] != result["step"]:
-        raise ValueError("Completed cell checkpoint/summary disagree")
+    verify(root, bound, item, selected)
     return True
 
 
 def pilot(root, bound, settings_path):
+    schedule.require_design(bound)
     from sftlib.sequence import ChildStop
     with ChildStop() as stop:
         runner = Runner(root, bound["inputs"]["sft_work"], settings_path, stop)
@@ -209,10 +185,9 @@ def pilot(root, bound, settings_path):
 
 
 def run(root, bound, settings_path):
+    schedule.require_design(bound)
     from sftlib.sequence import ChildStop
     selected = saved_pilot(root)
-    if not schedule.enabled(bound):
-        message("Resuming LEGACY independent-budget grid unchanged; continuous trajectories require a new grid root.")
     # Full measured forecast is printed before ANY grid cell is started.
     forecast = reporting.estimate(root, selected, bound["settings"])
     atomic_json(root / "estimate.json", forecast)
@@ -227,28 +202,12 @@ def run(root, bound, settings_path):
             return
         if not ensure_evaluation(root, bound, None, selected, runner):
             return
-        if schedule.enabled(bound):
-            return run_trajectories(root, bound, selected, runner, stop)
-        for index, item in enumerate(cells(), 1):
-            if stop.requested:
-                break
-            message(f"Grid cell {index}/25 · {item['id']} · "
-                    f"{item['on_policy_percent']}% online · {item['points']:,} points")
-            if not check_completed_training(root, bound, item, selected):
-                if not train_with_recovery(root, item, selected, runner):
-                    break
-                if not check_completed_training(root, bound, item, selected):
-                    break
-            if not ensure_evaluation(root, bound, item, selected, runner):
-                break
-            reporting.summary(root)
-        result = reporting.summary(root)
-        atomic_json(root / "status.json", {"status": "complete" if result["complete_cells"] == 25 else "paused",
-                                         "complete_cells": result["complete_cells"]})
+        return run_trajectories(root, bound, selected, runner, stop)
 
 
 def run_trajectories(root, bound, selected, runner, stop):
     """Resume each mixture's single full-state trajectory between evaluated prefixes."""
+    schedule.require_design(bound)
     for trajectory in schedule.trajectories():
         for nominal in schedule.EVALUATION_POINTS:
             if stop.requested:

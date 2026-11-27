@@ -13,6 +13,7 @@ import time
 from gridlib.policy import ROOT
 from gridlib.shared import SFT_CODE, RunLock, atomic_json, read_json
 from gridlib.inputs import inspect_pair, separate_work
+from gridlib.schedule import validate_root
 from sftlib.core import configure_local_storage
 from sftlib.console import message, output
 
@@ -98,6 +99,7 @@ def run(disk, accept_grid_estimate=False, reuse_student=False, reuse_sft=False):
         if not path.is_relative_to(disk):
             raise ValueError("Source packages and work directories must all be on POD_DISK")
     separate_work(grid_work, sft_work)
+    validate_root(grid_work, allow_new=True)
     if (state_dir.is_relative_to(sft_work) or sft_work.is_relative_to(state_dir)
             or state_dir.is_relative_to(grid_work) or grid_work.is_relative_to(state_dir)):
         raise ValueError("Use separate sft-work, gkd-grid-work and pipeline directories")

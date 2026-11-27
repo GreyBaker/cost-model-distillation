@@ -740,7 +740,7 @@ class DevelopmentTests(unittest.TestCase):
 
 class SmokeTests(unittest.TestCase):
     def test_real_engine_handoff_checks_restart_and_discards_only_owned_smoke_models(self):
-        from gridlib import backend, engine
+        from gridlib import backend, engine, schedule
         from sftlib import training
         tensor_type = type("FakeTensor", (), {})
         fake_torch = SimpleNamespace(Tensor=tensor_type, cuda=SimpleNamespace(empty_cache=lambda: None),
@@ -750,7 +750,7 @@ class SmokeTests(unittest.TestCase):
         calls = []
         def train(root, bound, item, selected, session_updates, microbatch):
             calls.append((root.name, microbatch, bound["inputs"]["paths"]["student_checkpoint"]))
-            run_dir = root / "cells" / item["id"]
+            run_dir = schedule.training_directory(root, item)
             latest = run_dir / "latest.json"
             step = read_json(latest)["step"] + 1 if latest.exists() else 1
             directory = run_dir / "checkpoints" / f"step-{step:08d}"

@@ -7,7 +7,7 @@ from pathlib import Path
 
 from . import evaluation
 from .controller import check_completed_training, saved_pilot
-from .policy import VALIDATION_N, cells
+from .policy import VALIDATION_N
 from .shared import read_json
 
 
@@ -49,13 +49,13 @@ def prediction_audit(output, expected=None, expected_n=VALIDATION_N):
 
 def audit(root, bound):
     from . import schedule
+    schedule.require_design(bound)
     selected = saved_pilot(root)
     baseline = Path(read_json(root / "baseline/latest_evaluation.json")["path"])
     evaluation.verify(baseline, evaluation.identity(root, bound, None, selected))
     expected = prediction_audit(baseline)
     verified = []
-    items = schedule.milestones() if schedule.enabled(bound) else cells()
-    for item in items:
+    for item in schedule.milestones():
         if not check_completed_training(root, bound, item, selected):
             raise ValueError(f"Incomplete cell: {item['id']}")
         owner = schedule.evaluation_directory(root, item)
@@ -64,7 +64,7 @@ def audit(root, bound):
         prediction_audit(output, expected)
         verified.append(item["id"])
     return {"status": "pass", "cells": verified, "validation_n": VALIDATION_N,
-            "training_design": bound.get("training_design", "legacy-independent-budget-cells"),
+            "training_design": schedule.DESIGN,
             "checks": ["immutable common initialization", "final checkpoint/evaluation hashes",
                        "point and exact-mixture counts", "exact validation ID/reference agreement",
                        "no duplicates", "reaggregated saved score means/counters", "EOS/cap/empty flags"],

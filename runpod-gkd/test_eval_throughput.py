@@ -14,20 +14,19 @@ from unittest.mock import patch
 
 sys.dont_write_bytecode = True
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from gridlib import backend, evalpilot, policy, recovery
-from gridlib.shared import atomic_json, read_json, sha256
+from gridlib import backend, evalpilot, policy, recovery, schedule
+from gridlib.shared import atomic_json, read_json, sha256, tree_manifest
 from sftlib import modeling
 
 
-def fixture(root, *, version=2, cap=256):
-    atomic_json(root / "binding.json", {"inputs": "immutable"})
+def fixture(root, *, cap=256):
+    atomic_json(root / "binding.json", {"inputs": "immutable", "training_design": schedule.DESIGN})
     atomic_json(root / "pilot.json", {"training": "immutable"})
     selected = {"microbatch": 4, "runtime": {"gpu": "mock", "total_memory": 1000}}
     bound = {"settings": {**policy.settings(), "evaluation_batch_cap": cap},
+             "training_design": schedule.DESIGN,
              "code": {"generation": "before"},
              "inputs": {"hashes": {"student": {"checkpoint": "immutable-student"}}}}
-    if version == 1:
-        atomic_json(root / "evaluation_pilot_request.json", evalpilot.request(root, bound, selected, version=1))
     return bound, selected
 
 
@@ -71,7 +70,7 @@ class ThroughputTests(unittest.TestCase):
             self.assertEqual(value["fastest_measured_batch"], 64)
             self.assertEqual(value["warmed_summaries_per_second"], 100.)
             self.assertEqual(len(calls), len(set(calls)))
-            for item in [None, *policy.cells()]:
+            for item in [None, *schedule.milestones()]:
                 self.assertEqual(recovery.evaluation_microbatch(root, bound, item, selected), 64)
             self.assertEqual(recovery.training_microbatch(root, selected), 4)
 
@@ -115,25 +114,23 @@ class ThroughputTests(unittest.TestCase):
             self.assertEqual(calls, previous)
             self.assertEqual(sha256(root / "evaluation_pilot.json"), before)
 
-    def test_completed_and_partial_v1_pilots_keep_original_capacity_policy(self):
+    def test_completed_and_partial_capacity_only_pilots_are_rejected_without_recalibration(self):
         for partial in (False, True):
             with self.subTest(partial=partial), tempfile.TemporaryDirectory() as d:
                 root = Path(d)
-                bound, selected = fixture(root, version=1)
-                first, second = [], []
+                bound, selected = fixture(root)
+                request = {**evalpilot.request(root, bound, selected), "version": 1}
+                request.pop("selection_policy")
+                request.pop("throughput_near_best_fraction")
                 if partial:
-                    self.assertFalse(self.ensure(root, bound, selected, first, stop_after=3))
-                bound["code"] = {"generation": "changed"}
-                self.assertTrue(self.ensure(root, bound, selected, second, {64: 1000., 144: 1.}))
-                if partial:
-                    self.assertTrue(set(first[:3]).isdisjoint(second))
-                value = evalpilot.saved(root, bound, selected)
-                self.assertEqual(value["request"]["version"], 1)
-                self.assertEqual(value["batch_size"], 144)
-                before, calls_before = sha256(root / "evaluation_pilot.json"), list(second)
-                self.ensure(root, bound, selected, second)
-                self.assertEqual(sha256(root / "evaluation_pilot.json"), before)
-                self.assertEqual(second, calls_before)
+                    atomic_json(root / "evaluation_pilot_request.json", request)
+                else:
+                    atomic_json(root / "evaluation_pilot.json", {"request": request})
+                before, calls = tree_manifest(root), []
+                with self.assertRaises(ValueError):
+                    self.ensure(root, bound, selected, calls)
+                self.assertFalse(calls)
+                self.assertEqual(tree_manifest(root), before)
 
     def test_partial_throughput_sweep_resumes_without_repeating_candidates(self):
         with tempfile.TemporaryDirectory() as d:

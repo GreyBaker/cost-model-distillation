@@ -6,8 +6,7 @@ import json
 import math
 from pathlib import Path
 
-from .policy import VALIDATION_N, cells, update_spec
-from .shared import atomic_json, read_json, sha256
+from .shared import atomic_json, read_json
 
 
 def select_pilot(results, candidates):
@@ -33,61 +32,8 @@ def select_pilot(results, candidates):
 
 
 def estimate(root, selected, settings):
-    from . import schedule
-    bound_path = root / "binding.json"
-    if bound_path.exists() and schedule.enabled(read_json(bound_path)):
-        from .trajectory_reporting import estimate as trajectory_estimate
-        return trajectory_estimate(root, selected, settings)
-    baseline_pointer = root / "baseline" / "latest_evaluation.json"
-    if not baseline_pointer.is_file():
-        raise ValueError("Finish the pilot's full baseline evaluation before estimating the grid")
-    from .evaluation import verify
-    output = Path(read_json(baseline_pointer)["path"])
-    baseline = verify(output, read_json(output / "COMPLETE.json")["identity"])
-    if baseline["n"] != VALIDATION_N or baseline["status"] != "complete":
-        raise ValueError("Full baseline evaluation missing")
-    mb = selected["microbatch"]
-    off = selected["off_policy"]["mean_update_seconds"] / (32 // mb)
-    on = selected["on_policy"]["mean_update_seconds"] / (32 // mb)
-    save_time = max(selected[key]["checkpoint_seconds"] for key in ("off_policy", "on_policy"))
-    # Pilot worker loads twice, scans longest rows, verifies hashes and saves.
-    # Half the residual is an intentionally rough per-cell startup allowance.
-    startup = max(0.0, max(
-        (selected[key]["wall_seconds"] - selected[key]["checkpoint_seconds"]
-         - sum(x["training_seconds"] for x in selected[key]["updates"])
-         - selected[key]["resumed_update"]["training_seconds"]) / 2
-        for key in ("off_policy", "on_policy")))
-    rows = []
-    for item in cells():
-        seconds = 0.0
-        for step in range(item["updates"]):
-            spec = update_spec(item, step)
-            seconds += math.ceil(spec["off"] / mb) * off + math.ceil(spec["on"] / mb) * on
-        saves = 1 + math.ceil(item["updates"] / settings["save_every_updates"])
-        rows.append({"cell": item["id"], "points": item["points"], "updates": item["updates"],
-                     "estimated_training_seconds": seconds,
-                     "estimated_checkpoint_seconds": saves * save_time,
-                     "estimated_initialization_seconds": startup,
-                     "estimated_evaluation_seconds": baseline["evaluation_seconds"],
-                     "estimated_total_seconds": seconds + saves * save_time + startup + baseline["wall_seconds"]})
-    from .recovery import training_microbatch
-    active = training_microbatch(root, selected)
-    return {"basis": "Measured joint-fit pilot on the actual GPU plus full common-baseline validation",
-            "pilot_sha256": sha256(root / "pilot.json"), "cells": rows,
-            "pilot_microbatch": selected["microbatch"], "active_training_microbatch": active,
-            "evaluation_pilot_batch": (read_json(root / "evaluation_pilot.json")["batch_size"]
-                                       if (root / "evaluation_pilot.json").exists() else None),
-            "evaluation_pilot_sha256": (sha256(root / "evaluation_pilot.json")
-                                        if (root / "evaluation_pilot.json").exists() else None),
-            "forecast_stale_after_oom": active != selected["microbatch"],
-            "training_hours": sum(x["estimated_training_seconds"] for x in rows) / 3600,
-            "evaluation_hours": sum(x["estimated_evaluation_seconds"] for x in rows) / 3600,
-            "total_grid_hours": sum(x["estimated_total_seconds"] for x in rows) / 3600,
-            "baseline_already_spent_hours": baseline["wall_seconds"] / 3600,
-            "warning": "Projection, not a time/billing cap. Online pilot forces 64 tokens; actual generation lengths "
-                       "and mixed-batch overhead vary. Pilot costs, failures/replayed work and storage excluded. "
-                       "Full-grid forecast, not remaining-time forecast after a partial grid. "
-                       "After OOM batch reduction this remains the ORIGINAL pilot forecast, not a fresh throughput measurement."}
+    from .trajectory_reporting import estimate as trajectory_estimate
+    return trajectory_estimate(root, selected, settings)
 
 
 def records(path):
@@ -107,8 +53,7 @@ def records(path):
 
 def summary(root):
     from . import schedule
-    bound_path = root / "binding.json"
-    continuous = bound_path.exists() and schedule.enabled(read_json(bound_path))
+    schedule.validate_root(root)
     stages = records(root / "stages.jsonl")
     baseline_metrics = {}
     baseline_pointer = root / "baseline/latest_evaluation.json"
@@ -119,12 +64,12 @@ def summary(root):
                 "evaluation_seconds": baseline_metrics.get("evaluation_seconds"),
                 "scores": baseline_metrics.get("scores", {})}
     rows = []
-    for item in (schedule.milestones() if continuous else cells()):
+    for item in schedule.milestones():
         run_dir = schedule.evaluation_directory(root, item)
-        training_owner = root / "trajectories" / item["trajectory_id"] if continuous else run_dir
-        training_path = run_dir / ("snapshot.json" if continuous else "training_summary.json")
+        training_owner = root / "trajectories" / item["trajectory_id"]
+        training_path = run_dir / "snapshot.json"
         training = read_json(training_path) if training_path.exists() else {}
-        if continuous and training:
+        if training:
             training = {**training["accounting"], "status": "complete",
                         "microbatch": read_json(run_dir / "checkpoint/metadata.json")
                         .get("execution_config", {}).get("microbatch")}
@@ -133,11 +78,11 @@ def summary(root):
         if pointer.exists():
             evaluation = read_json(Path(read_json(pointer)["path"]) / "metrics.json")
         events = [event for path in sorted((training_owner / "sessions").glob("*.jsonl")) for event in records(path)
-                  if not continuous or event.get("step", 0) <= item["updates"]]
+                  if event.get("step", 0) <= item["updates"]]
         batch_sessions = [event["microbatch"] for event in sorted(events, key=lambda e: e.get("unix_time", 0))
                           if event["event"] == "initialized" and "microbatch" in event]
         own_stages = [x for x in stages if x["cell"] == item["id"] or
-                      (continuous and x["cell"] == item["trajectory_id"]
+                      (x["cell"] == item["trajectory_id"]
                        and x.get("until_points") == item["budget_points"])]
         train_wall = sum(x["seconds"] for x in own_stages if x["operation"] == "train")
         eval_wall = sum(x["seconds"] for x in own_stages if x["operation"] == "evaluate")
@@ -188,22 +133,21 @@ def summary(root):
                                   "Shared pilot/baseline/controller overhead is separate; evaluation_pilot_wall_seconds "
                                   "is a component of shared_stage_wall_seconds, not an additional cost. "
                                   "Killed controllers may leave unmeasured stages."}
-    if continuous:
-        result["training_design"] = schedule.DESIGN
-        result["complete_milestones"] = result["complete_cells"]
-        result["complete_trajectories"] = sum(
-            all(row["status"] == "complete" for row in rows if row["on_policy_percent"] == percent)
-            for percent in schedule.PERCENTAGES)
-        result["committed_training_seconds"] = sum(
-            read_json(path)["training_seconds"] for item in schedule.trajectories()
-            if (path := schedule.training_directory(root, item) / "training_summary.json").exists())
-        result["recorded_training_stage_wall_seconds"] = sum(
-            event["seconds"] for event in stages if event["operation"] == "train")
-        result["time_accounting"] += (
-            " Milestone training_seconds and example/update/token counts are CUMULATIVE prefixes "
-            "of one trajectory per mixture; DO NOT sum them across milestones. "
-            "committed_training_seconds counts each trajectory once. "
-            "Row training_wall_seconds covers only that milestone's incremental training stage.")
+    result["training_design"] = schedule.DESIGN
+    result["complete_milestones"] = result["complete_cells"]
+    result["complete_trajectories"] = sum(
+        all(row["status"] == "complete" for row in rows if row["on_policy_percent"] == percent)
+        for percent in schedule.PERCENTAGES)
+    result["committed_training_seconds"] = sum(
+        read_json(path)["training_seconds"] for item in schedule.trajectories()
+        if (path := schedule.training_directory(root, item) / "training_summary.json").exists())
+    result["recorded_training_stage_wall_seconds"] = sum(
+        event["seconds"] for event in stages if event["operation"] == "train")
+    result["time_accounting"] += (
+        " Milestone training_seconds and example/update/token counts are CUMULATIVE prefixes "
+        "of one trajectory per mixture; DO NOT sum them across milestones. "
+        "committed_training_seconds counts each trajectory once. "
+        "Row training_wall_seconds covers only that milestone's incremental training stage.")
     atomic_json(root / "summary.json", result)
     buffer = io.StringIO(newline="")
     writer = csv.DictWriter(buffer, fieldnames=list(rows[0]))

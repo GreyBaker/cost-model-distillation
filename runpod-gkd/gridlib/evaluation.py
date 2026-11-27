@@ -6,7 +6,7 @@ from pathlib import Path
 import time
 
 from .policy import PROTOCOL, VALIDATION_N
-from .shared import (atomic_json, checkpoints, read_json, sha256, tree_manifest,
+from .shared import (atomic_json, read_json, sha256, tree_manifest,
                      verify_tree)
 from sftlib.console import output as display, progress
 
@@ -25,21 +25,15 @@ def verify(output, identity):
 
 
 def source(root, bound, item):
+    from .schedule import require_design, require_milestone
+    require_design(bound)
     if item is None:
         directory = Path(bound["inputs"]["paths"]["student_checkpoint"])
-    elif "trajectory_id" in item:
+    else:
+        require_milestone(item)
         from .controller import saved_pilot
         from .milestones import verify
         directory, _ = verify(root, bound, item, saved_pilot(root))
-    else:
-        run_dir = root / "cells" / item["id"]
-        result = read_json(run_dir / "training_summary.json")
-        if result.get("status") != "complete" or result["cell"] != item:
-            raise ValueError("Evaluate only a completed matching cell")
-        directory = checkpoints.resolve(run_dir)
-        if str(directory) != result["checkpoint"]:
-            raise ValueError("Training result does not refer to latest cell checkpoint")
-        checkpoints.verify(directory, read_json(run_dir / "run.json")["run_id"])
     return directory
 
 
@@ -50,8 +44,7 @@ def identity(root, bound, item, selected):
             "binding_sha256": sha256(root / "binding.json"),
             "protocol": PROTOCOL, "batch_size": evaluation_microbatch(root, bound, item, selected),
              "precision": "bfloat16", "split": "validation", "n": VALIDATION_N}
-    if (root / "evaluation_pilot.json").exists():
-        result["evaluation_pilot_sha256"] = sha256(root / "evaluation_pilot.json")
+    result["evaluation_pilot_sha256"] = sha256(root / "evaluation_pilot.json")
     return result
 
 

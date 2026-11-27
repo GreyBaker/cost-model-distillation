@@ -84,23 +84,19 @@ def inspect_pair(sft_work, full=True):
 
 
 def binding(root, sft_work, settings, create=False, full=True):
-    from .schedule import DESIGN, enabled
+    from .schedule import DESIGN, validate_root
+    saved = validate_root(root, allow_new=create)
     separate_work(root, sft_work)
     definition = {"inputs": inspect_pair(sft_work, full=full), "settings": settings,
-                  "protocol": PROTOCOL, "code": code_signature()}
+                  "protocol": PROTOCOL, "code": code_signature(), "training_design": DESIGN}
     path = root / "binding.json"
     if path.exists():
-        saved = read_json(path)
-        enabled(saved)
-        if "training_design" in saved:
-            definition["training_design"] = DESIGN
         if ({k: v for k, v in saved.items() if k != "code"}
                 != {k: v for k, v in definition.items() if k != "code"}):
             raise ValueError("Bound SFT inputs/settings changed. Use a new grid directory.")
         if create or full:
             record_migration(root / "code_migrations", {"code": saved["code"]}, {"code": definition["code"]})
     elif create:
-        definition["training_design"] = DESIGN
         root.mkdir(parents=True, exist_ok=True)
         atomic_json(path, definition)
     else:

@@ -49,7 +49,7 @@ def weights(directory):
 
 def run(work):
     import torch
-    from gridlib import backend, engine, policy
+    from gridlib import backend, engine, policy, schedule
     from sftlib import checkpoints
     from sftlib.training import seed
     final = pair_root(work) / "reports/smoke"
@@ -61,7 +61,8 @@ def run(work):
     for role in ("student", "teacher"):
         verify(model_path(work, role), identity(work, "model", role=role))
     settings = policy.settings()
-    bound = {"inputs": bound_inputs(work), "settings": settings, "protocol": policy.PROTOCOL}
+    bound = {"inputs": bound_inputs(work), "settings": settings, "protocol": policy.PROTOCOL,
+             "training_design": schedule.DESIGN}
     device, info, tokenizer, student, teacher, data = backend.load_pair(bound, settings)
     if teacher.training or any(p.requires_grad for p in teacher.parameters()):
         raise ValueError("Grid teacher is not frozen/eval")
@@ -82,7 +83,7 @@ def run(work):
     atomic_json(a / "binding.json", {"kind": "disposable-external-smoke", **bound})
     selected = {"microbatch": 2, "runtime": info}
     atomic_json(a / "pilot.json", {"selected": selected, "kind": "disposable-smoke-not-grid-pilot"})
-    item = policy.cell(500, 50)
+    item = schedule.trajectory(50)
     before = time.monotonic()
     engine.train(a, bound, item, selected, session_updates=1, microbatch=2)
     gc.collect()
@@ -92,7 +93,7 @@ def run(work):
         engine.train(root, bound, item, selected, session_updates=1, microbatch=2)
         gc.collect()
         torch.cuda.empty_cache()
-    run_a, run_b = a / "cells" / item["id"], b / "cells" / item["id"]
+    run_a, run_b = schedule.training_directory(a, item), schedule.training_directory(b, item)
     ca, cb = checkpoints.resolve(run_a), checkpoints.resolve(run_b)
     sa = torch.load(ca / "training_state.pt", map_location="cpu", weights_only=True)
     sb = torch.load(cb / "training_state.pt", map_location="cpu", weights_only=True)
