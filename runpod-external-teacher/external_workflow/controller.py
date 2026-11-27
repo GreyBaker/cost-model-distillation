@@ -13,6 +13,7 @@ from .common import (OOM_EXIT, REPO, ROOT, RunLock, append, atomic_json, check_s
 from sftlib.console import message, run_logged
 from sftlib.core import CONFIGS, configure_local_storage
 from sftlib.sequence import ChildStop, verified_student
+from .reporting import display_quality
 
 
 class ExternalOOM(RuntimeError):
@@ -219,7 +220,7 @@ def run(args):
                 status("paused")
                 return
             report = read_json(pair_root(work) / "reports/quality/report.json")
-            message(f"Measured pair quality (informational only): {report}")
+            display_quality(work, report)
             if not args.accept_pair:
                 status("awaiting_pair_approval", report=report)
                 message("Review reports, then rerun unchanged arguments with --accept-pair.")

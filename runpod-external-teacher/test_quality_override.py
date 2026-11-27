@@ -14,7 +14,7 @@ import unittest
 from unittest.mock import patch
 
 import external_teacher
-from external_workflow import common, controller, evaluation, pair, quality_policy
+from external_workflow import common, controller, evaluation, pair, quality_policy, reporting
 from gridlib import inputs
 from quality_override_fixture import RUNTIME, artifact, failed_pair
 from sftlib.core import atomic_json, read_json, sha256, tree_manifest
@@ -52,6 +52,27 @@ class PolicyTests(unittest.TestCase):
                        {"advantage": float("inf")}, {"paired_bootstrap_95ci": [float("nan"), 0.]}):
             with self.subTest(change=change), self.assertRaises(ValueError):
                 quality_policy.validate_report({**report, **change})
+        # Display even poor/negative measurements; unavailable optional metrics
+        # do not introduce a new quality gate or create any files.
+        shown = {**report, "publisher_teacher_r2": 21.37, "teacher_minus_publisher_r2": -21.37,
+                 "historical_our_student_r2": 15.45}
+        with tempfile.TemporaryDirectory() as d, contextlib.redirect_stdout(io.StringIO()) as console:
+            work = Path(d) / "absent"
+            reporting.display_quality(work, shown)
+            reporting.display_quality(work, {"scores": {"student": 0.}})
+            self.assertFalse(work.exists())
+            atomic_json(work / "pair/validation/student/metrics.json", {})
+            (work / "pair/validation/student/metrics.json").write_text("invalid JSON", encoding="utf-8")
+            atomic_json(work / "pair/validation/teacher/metrics.json", {"scores": {"rouge2": 20.5}})
+            reporting.display_quality(work, shown)
+        text = console.getvalue()
+        for expected in ("Reported quality-summary teacher R2: 0.000000",
+                         "Reported teacher-minus-student R2: -99.000000",
+                         "Paired bootstrap 95% CI: [-100.000000, -98.000000]",
+                         "Reported teacher-minus-publisher R2: -21.370000",
+                         "Historical our-student R2 (reference): 15.450000",
+                         "Teacher full validation: rouge2=20.500000"):
+            self.assertIn(expected, text)
 
     def test_old_cli_quality_flags_are_accepted_but_no_longer_configure_gates(self):
         with tempfile.TemporaryDirectory() as d:
@@ -111,7 +132,7 @@ class ReportIntegrationTests(unittest.TestCase):
                 patch.object(controller, "configure_local_storage"), patch.object(controller, "runtime"), \
                 patch.object(controller.Runner, "worker", worker), patch.object(controller.Runner, "call", call), \
                 patch.object(pair, "environment", return_value=RUNTIME["environment"]), \
-                patch.dict(os.environ, {}, clear=False), contextlib.redirect_stdout(io.StringIO()):
+                patch.dict(os.environ, {}, clear=False), contextlib.redirect_stdout(io.StringIO()) as console:
             controller.run(args)
             self.assertEqual(calls[-1], "quality")
             self.assertNotIn("smoke", calls)
@@ -125,6 +146,16 @@ class ReportIntegrationTests(unittest.TestCase):
             self.assertEqual(calls[-3:], ["grid-bind", "grid-pilot", "grid-estimate"])
             self.assertNotIn("grid-run", calls)
             self.assertEqual(read_json(work / "status.json")["phase"], "awaiting_grid_approval")
+        text = console.getvalue()
+        for expected in ("Student full validation: rouge1=10.010000, rouge2=10.010000, rougeL=10.010000",
+                         "Teacher full validation: rouge1=20.900000, rouge2=20.900000, rougeL=20.900000",
+                         "Full-validation teacher-minus-student R2: 10.890000",
+                         "Reported quality-summary teacher R2: 21.000000",
+                         "Reported teacher-minus-student R2: 11.000000",
+                         "Paired bootstrap 95% CI: [10.000000, 12.000000]",
+                         "Publisher public-student R2 (reference): 16.055376",
+                         "informational only"):
+            self.assertIn(expected, text)
         manifest = read_json(root / "prepared_pair.json")
         self.assertEqual(manifest["quality_policy"], "informational-only")
         self.assertNotIn("quality_override", manifest["artifacts"])

@@ -138,10 +138,9 @@ def quality(work):
     rows = paired_rows(pair_root(work))
     low, high = bootstrap([t["scores"]["rouge2"] - s["scores"]["rouge2"]
                           for s, t in zip(rows["student"], rows["teacher"])])
-    # paired_rows verified these aggregates against the saved per-example scores.
-    # Use the persisted measurement as canonical: Python 3.12+ sum can round
-    # differently from evaluate()'s incremental accumulation. Existing reports
-    # remain immutable and are accepted using the same strict absolute tolerance.
+    # Use persisted measurements, not another aggregate equality check.
+    # Complete IDs/references, artifact integrity and finite values were checked
+    # above; existing cached reports remain immutable and informational.
     scores = {role: read_json(pair_root(work) / "validation" / role / "metrics.json")["scores"]["rouge2"]
               for role in rows}
     advantage = scores["teacher"] - scores["student"]
