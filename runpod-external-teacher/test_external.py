@@ -463,12 +463,20 @@ class ModelContractTests(unittest.TestCase):
 
     def test_public_student_export_has_real_file_hashes_and_no_fake_sft_state(self):
         class Model:
-            config = SimpleNamespace(use_cache=False)
+            def __init__(self):
+                self.config = SimpleNamespace(use_cache=False, tie_word_embeddings=True, scale_decoder_outputs=False)
+                self.shared = SimpleNamespace(untyped_storage=lambda: SimpleNamespace(data_ptr=lambda: id(self.shared)))
+                self.head = SimpleNamespace(untyped_storage=lambda: SimpleNamespace(data_ptr=lambda: id(self.head)))
+            def get_input_embeddings(self):
+                return SimpleNamespace(weight=self.shared)
+            def get_output_embeddings(self):
+                return SimpleNamespace(weight=self.head)
             def parameters(self):
                 return [SimpleNamespace(numel=lambda: 1, element_size=lambda: 4)]
             def save_pretrained(self, path, **kwargs):
                 atomic_json(path / "config.json", {"external_pair_profile": self.config.external_pair_profile,
-                                                  "scale_decoder_outputs": False})
+                                                  "scale_decoder_outputs": self.config.scale_decoder_outputs,
+                                                  "tie_word_embeddings": self.config.tie_word_embeddings})
                 (path / "model.safetensors").write_bytes(b"tiny weights")
         class IDs:
             def cpu(self):
@@ -482,31 +490,45 @@ class ModelContractTests(unittest.TestCase):
             atomic_json(work / "run.json", {"definition": {"student": "public"}})
             source = work / "pair/sources/public_student"
             atomic_json(source / "COMPLETE.json", {"source": "fake locked source"})
+            atomic_json(source / "config.json", {"tie_word_embeddings": True, "scale_decoder_outputs": False})
             before = tree_manifest(source)
             tokenizer = SimpleNamespace(save_pretrained=lambda p: (p / "tokenizer.json").write_text("{}"))
             fake_safetensors = SimpleNamespace(load_file=lambda p: {}, save_file=lambda x, p: p.write_bytes(b"probe"))
+            def load_model(path, *args, **kwargs):
+                model = Model()
+                if (path / "config.json").is_file():
+                    model.config = SimpleNamespace(**read_json(path / "config.json"))
+                return model
+            probe_flags = []
+            def probe(model, *args, **kwargs):
+                probe_flags.append(model.config.tie_word_embeddings)
+                return tensors
             with patch.dict("sys.modules", {"torch": SimpleNamespace(cuda=SimpleNamespace(empty_cache=lambda: None),
                                                                    equal=lambda a, b: a is b),
                                            "safetensors": SimpleNamespace(torch=fake_safetensors),
                                            "safetensors.torch": fake_safetensors}), \
                     patch.object(models, "runtime", return_value=("cuda", RUNTIME)), \
                     patch.object(models, "verified_model_source", return_value=source), \
-                    patch.object(models, "load_model", side_effect=[Model(), Model()]) as load, \
+                    patch.object(models, "load_model", side_effect=load_model) as load, \
                     patch.object(models, "load_tokenizer", return_value=tokenizer), \
                     patch.object(models, "probe_rows", return_value=[]), \
                     patch.object(models, "inventory", return_value=inv), \
-                    patch.object(models, "tensors_and_gradients", return_value=tensors), \
+                    patch.object(models, "tensors_and_gradients", side_effect=probe), \
                     patch.object(models, "compare", return_value={"rtol": 1e-4, "atol": 1e-4, "max_abs_error": 0}), \
                     patch.object(models, "make_inputs", return_value=({}, None)), \
                     patch.object(models, "greedy", return_value=ids), patch.object(models, "check_space"):
                 models.export(work, "student")
             self.assertEqual(load.call_count, 2)
+            self.assertEqual(probe_flags, [True, False, False])
             exported = work / "pair/models/student_fp32"
             common.verify(exported, common.identity(work, "model", role="student"))
             provenance = read_json(exported / "provenance.json")
             self.assertEqual(provenance["origin"], "external-public-sft")
             self.assertEqual(provenance["local_sft_updates"], 0)
             self.assertEqual(provenance["historical_steps_status"], "publisher-reported")
+            self.assertFalse(read_json(exported / "config.json")["tie_word_embeddings"])
+            self.assertTrue(provenance["config_normalization"]["source_loaded_config"]["tie_word_embeddings"])
+            self.assertFalse(provenance["config_normalization"]["export_config"]["tie_word_embeddings"])
             self.assertFalse((exported / "training_state.pt").exists())
             self.assertEqual(tree_manifest(source), before)
 

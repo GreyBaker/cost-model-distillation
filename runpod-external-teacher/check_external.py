@@ -34,6 +34,8 @@ def main(argv=None):
     selection = parser.add_mutually_exclusive_group()
     selection.add_argument("--quality-report", "--quality-override", dest="quality_report", action="store_true",
                            help="Run only informational-quality, integrity and legacy-compatibility checks")
+    selection.add_argument("--model-config", action="store_true",
+                           help="Run only untied export-config normalization and model-contract checks")
     selection.add_argument("--all", action="store_true", help="Run the full regression suite (default)")
     args = parser.parse_args(argv)
     blocker = NoML()
@@ -42,6 +44,11 @@ def main(argv=None):
         with patch.object(socket.socket, "connect", side_effect=AssertionError("Network blocked by mocked checks")):
             if args.quality_report:
                 suite = unittest.defaultTestLoader.loadTestsFromName("test_quality_override")
+            elif args.model_config:
+                suite = unittest.TestSuite([
+                    unittest.defaultTestLoader.loadTestsFromName("test_model_config"),
+                    unittest.defaultTestLoader.loadTestsFromName("test_external.ModelContractTests"),
+                ])
             else:
                 suite = unittest.TestSuite([
                     unittest.defaultTestLoader.discover(str(ROOT), pattern="test_*.py"),
