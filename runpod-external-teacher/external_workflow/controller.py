@@ -115,7 +115,8 @@ def storage_projection(value):
         "canonical_models": student_bytes + (teacher_bytes + 1) // 2,
         # Conservative optimizer upper allowance: another full model per state,
         # though factored Adafactor typically needs substantially less.
-        "grid_25_cells_two_restarts_each": 25 * 2 * 2 * student_bytes,
+        "grid_5_trajectories_two_rolling_restarts_each": 5 * 2 * 2 * student_bytes,
+        "grid_45_permanent_full_state_milestones": 45 * 2 * student_bytes,
         "grid_pilot_and_transient_checkpoints": 10 * student_bytes,
         "prepared_tables_and_data_caches_allowance": 10 * 1024 ** 3,
         "reports_and_miscellaneous_reserve": 5 * 1024 ** 3,

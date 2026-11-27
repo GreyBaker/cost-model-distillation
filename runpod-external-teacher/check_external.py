@@ -47,7 +47,7 @@ def main(argv=None):
                     unittest.defaultTestLoader.discover(str(ROOT), pattern="test_*.py"),
                     unittest.defaultTestLoader.discover(str(ROOT), pattern="check_scheme.py"),
                     unittest.defaultTestLoader.discover(
-                        str(ROOT.parent / "runpod-gkd"), pattern="test_eval_throughput.py",
+                        str(ROOT.parent / "runpod-gkd"), pattern="test_*.py",
                         top_level_dir=str(ROOT.parent / "runpod-gkd")),
                 ])
             result = unittest.TextTestRunner(verbosity=1).run(suite)

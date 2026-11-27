@@ -38,7 +38,8 @@ def training_microbatch(root, selected):
 
 
 def evaluation_path(root, item):
-    owner = root / "cells" / item["id"] if item else root / "baseline"
+    from .schedule import evaluation_directory
+    owner = evaluation_directory(root, item)
     return owner / "evaluation_batching.json"
 
 
@@ -70,17 +71,19 @@ def lower(root, path, initial, failed, *, training=False, **context):
 
 
 def checkpoint_for_retry(root, item):
-    run_dir = root / "cells" / item["id"]
+    from .schedule import training_directory
+    run_dir = training_directory(root, item)
     checkpoint = checkpoints.resolve(run_dir)
     marker = checkpoints.verify(checkpoint, read_json(run_dir / "run.json")["run_id"])
     return checkpoint, marker
 
 
-def train_with_recovery(root, item, selected, runner):
+def train_with_recovery(root, item, selected, runner, until_points=None):
     while True:
         microbatch = training_microbatch(root, selected)
         try:
-            return runner.call("train", item["id"], "--cell", item["id"], "--microbatch", microbatch)
+            extra = [] if until_points is None else ["--until-points", until_points]
+            return runner.call("train", item["id"], "--cell", item["id"], "--microbatch", microbatch, *extra)
         except CudaOOM as error:
             # No incomplete gradients/optimizer updates are salvaged from the failed worker.
             # The new worker restores ONLY this cell's most recent complete checkpoint.

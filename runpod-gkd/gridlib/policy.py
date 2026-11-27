@@ -82,6 +82,9 @@ def cells():
 def update_spec(item, completed_updates):
     if type(completed_updates) is not int or not 0 <= completed_updates < item["updates"]:
         raise ValueError("No next update")
+    if "training_design" in item:
+        from .schedule import update
+        return update(item, completed_updates)
     groups = min(item["groups_per_update"],
                  item["groups"] - completed_updates * item["groups_per_update"])
     online = groups * item["group_online"]
@@ -118,7 +121,7 @@ def code_signature():
     return {p.relative_to(ROOT.parent).as_posix(): sha256(p) for p in paths}
 
 
-def plan():
+def legacy_plan():
     grid = cells()
     return {"operation": "read-only plan; no ML, network, GPU or training",
             "protocol": PROTOCOL, "cells": grid,
@@ -137,4 +140,9 @@ def plan():
                 for rate in (10, 50, 100)],
             "estimate_warning": "A100 planning scenarios, NOT measured A100 throughput. "
                                 "Add 1.64h evaluation IF 50 summaries/s, plus pilot/IO/loading. "
-                                "Use measured pilot estimate before authorizing execution."}
+                                 "Use measured pilot estimate before authorizing execution."}
+
+
+def plan():
+    from .schedule import plan as continuous_plan
+    return continuous_plan()

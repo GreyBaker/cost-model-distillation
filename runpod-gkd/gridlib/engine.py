@@ -1,4 +1,4 @@
-"""Independent-cell training, strict full-state restart, joint-fit pilots."""
+"""Legacy cells/continuous mixtures, strict full-state restart, joint-fit pilots."""
 from __future__ import annotations
 
 import heapq
@@ -9,6 +9,7 @@ import time
 import uuid
 
 from .policy import PROTOCOL, TRAIN_N, chunks, lr_factor, update_spec
+from . import schedule
 from .shared import Cursor, atomic_json, checkpoints, read_json, sha256
 from sftlib.console import duration, message, progress
 
@@ -30,6 +31,11 @@ def check_state(state, item):
     steps = state["step"]
     if type(steps) is not int or not 0 <= steps <= item["updates"]:
         raise ValueError("Invalid saved update count")
+    if "training_design" in item:
+        expected = schedule.accounting(item, steps)
+        if any(state[k] != v for k, v in expected.items()):
+            raise ValueError("Checkpoint point/mixture/data-cursor accounting differs")
+        return
     groups = min(item["groups"], steps * item["groups_per_update"])
     expected = {"cursor": groups * item["group_size"], "points": groups * item["group_cost"],
                 "on_policy_examples": groups * item["group_online"],
@@ -38,7 +44,7 @@ def check_state(state, item):
         raise ValueError("Checkpoint point/mixture/data-cursor accounting differs")
 
 
-def train(root, bound, item, selected, session_updates=None, microbatch=None):
+def train(root, bound, item, selected, session_updates=None, microbatch=None, until_points=None):
     started = time.monotonic()
     import torch
     from sftlib.training import StopRequest, seed, rng_state, restore_rng
@@ -47,7 +53,12 @@ def train(root, bound, item, selected, session_updates=None, microbatch=None):
     microbatch = selected["microbatch"] if microbatch is None else microbatch
     if type(microbatch) is not int or not 1 <= microbatch <= selected["microbatch"] or 32 % microbatch:
         raise ValueError("Microbatch must be a positive divisor of 32 no larger than the original pilot selection")
-    run_dir = root / "cells" / item["id"]
+    run_dir = schedule.training_directory(root, item)
+    target_step = item["updates"]
+    if until_points is not None:
+        if "training_design" not in item:
+            raise ValueError("Point milestone stops require a continuous trajectory")
+        target_step = schedule.milestone(item["on_policy_percent"], until_points)["updates"]
     run_file = run_dir / "run.json"
     value = {"cell": item, "microbatch": selected["microbatch"], "settings": settings,
              "protocol": PROTOCOL}
@@ -112,6 +123,9 @@ def train(root, bound, item, selected, session_updates=None, microbatch=None):
     def save(reason):
         nonlocal last_saved
         if last_saved == state["step"]:
+            if "training_design" in item:
+                from .milestones import retain
+                retain(root, bound, item, selected, checkpoints.resolve(run_dir), state)
             return
         before = time.monotonic()
         checkpoints.save(run_dir, student, tokenizer,
@@ -120,6 +134,9 @@ def train(root, bound, item, selected, session_updates=None, microbatch=None):
                            "branch_rng": branch_rng.getstate(),
                            "execution_config": {**value, "microbatch": microbatch}}, reason)
         last_saved = state["step"]
+        if "training_design" in item:
+            from .milestones import retain
+            retain(root, bound, item, selected, checkpoints.resolve(run_dir), state)
         append(session, {"event": "checkpoint", "step": last_saved,
                          "seconds": time.monotonic() - before})
         message(f"{item['id']} checkpoint saved: update {last_saved:,}, "
@@ -135,7 +152,11 @@ def train(root, bound, item, selected, session_updates=None, microbatch=None):
         with StopRequest() as stop:
             # A failed first update can resume from an owned zero-update restart.
             save("initial state")
-            while state["step"] < item["updates"] and not stop.requested:
+            if state["step"] > target_step:
+                raise ValueError("Cannot reconstruct an earlier missing milestone from later weights")
+            recovery_steps = {row[2] for row in schedule.boundaries(item["on_policy_percent"])} \
+                if "training_design" in item else None
+            while state["step"] < target_step and not stop.requested:
                 spec = update_spec(item, state["step"])
                 # Include host row selection/mixture planning in synchronized update time.
                 torch.cuda.synchronize(device)
@@ -168,8 +189,10 @@ def train(root, bound, item, selected, session_updates=None, microbatch=None):
                 bar.update(spec["points"])
                 stopping = stop.requested or (session_updates is not None
                                               and state["step"] - start_step >= session_updates)
-                if stopping or state["step"] == item["updates"] or state["step"] % settings["save_every_updates"] == 0:
-                    save("pause/final" if stopping or state["step"] == item["updates"] else "periodic")
+                periodic = (state["step"] in recovery_steps if recovery_steps is not None
+                            else state["step"] % settings["save_every_updates"] == 0)
+                if stopping or state["step"] == target_step or periodic:
+                    save("pause/final" if stopping or state["step"] == target_step else "periodic")
                 if stopping:
                     break
             save("session end")

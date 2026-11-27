@@ -16,6 +16,7 @@ from .engine import append, check_state
 from .recovery import (CudaOOM, OOM_EXIT_CODE, evaluation_microbatch, evaluation_path,
                         evaluation_initial, lower, train_with_recovery)
 from . import evalpilot
+from . import schedule
 from sftlib.console import message, output as display, run_logged
 
 
@@ -37,8 +38,11 @@ class Runner:
         started = time.monotonic()
         code = None
         attempt = self.root / "attempts" / (uuid.uuid4().hex + ".json")
+        stage_context = ({"until_points": int(extra[extra.index("--until-points") + 1])}
+                         if "--until-points" in extra else {})
         append(self.root / "stage_starts.jsonl",
-               {"cell": cell_id, "operation": operation, "log": str(log), "unix_time": time.time()})
+               {"cell": cell_id, "operation": operation, "log": str(log), "unix_time": time.time(),
+                **stage_context})
         message(f"{cell_id} · {operation} | log: {log}")
         try:
             worker_extra = [*extra]
@@ -61,7 +65,7 @@ class Runner:
         finally:
             append(self.root / "stages.jsonl",
                    {"cell": cell_id, "operation": operation, "seconds": time.monotonic() - started,
-                    "return_code": code, "log": str(log)})
+                    "return_code": code, "log": str(log), **stage_context})
             if cell_id != "shared":
                 reporting.summary(self.root)
 
@@ -82,8 +86,11 @@ def ensure_evaluation(root, bound, item, selected, runner):
             return evaluation_attempt(root, bound, item, selected, runner)
         except CudaOOM as error:
             if item is not None:
-                from .recovery import checkpoint_for_retry
-                checkpoint_for_retry(root, item)
+                if "trajectory_id" in item:
+                    evaluation.source(root, bound, item)
+                else:
+                    from .recovery import checkpoint_for_retry
+                    checkpoint_for_retry(root, item)
             initial = evaluation_initial(root, bound, selected)
             lower(root, evaluation_path(root, item), initial,
                   evaluation_microbatch(root, bound, item, selected),
@@ -91,7 +98,7 @@ def ensure_evaluation(root, bound, item, selected, runner):
 
 
 def evaluation_attempt(root, bound, item, selected, runner):
-    owner = root / "cells" / item["id"] if item else root / "baseline"
+    owner = schedule.evaluation_directory(root, item)
     owner.mkdir(parents=True, exist_ok=True)
     pointer = owner / "latest_evaluation.json"
     expected = evaluation.identity(root, bound, item, selected)
@@ -117,7 +124,18 @@ def evaluation_attempt(root, bound, item, selected, runner):
                        "--microbatch", evaluation_microbatch(root, bound, item, selected))
 
 
+def training_config(bound, item, selected):
+    return {"cell": item, "microbatch": selected["microbatch"], "settings": bound["settings"],
+            "protocol": bound["protocol"]}
+
+
 def check_completed_training(root, bound, item, selected):
+    if "trajectory_id" in item:
+        from .milestones import verify
+        if not (schedule.evaluation_directory(root, item) / "snapshot.json").exists():
+            return False
+        verify(root, bound, item, selected)
+        return True
     run_dir = root / "cells" / item["id"]
     path = run_dir / "training_summary.json"
     if not path.exists():
@@ -126,9 +144,7 @@ def check_completed_training(root, bound, item, selected):
     if result.get("status") != "complete":
         return False
     run = read_json(run_dir / "run.json")
-    if (result["cell"] != item or run["config"] !=
-            {"cell": item, "microbatch": selected["microbatch"], "settings": bound["settings"],
-             "protocol": bound["protocol"]}
+    if (result["cell"] != item or run["config"] != training_config(bound, item, selected)
             or run["signatures"] != {"binding_sha256": sha256(root / "binding.json"),
                                       "pilot_sha256": sha256(root / "pilot.json")}
             or run["initial_student"] != bound["inputs"]["paths"]["student_checkpoint"]):
@@ -195,6 +211,8 @@ def pilot(root, bound, settings_path):
 def run(root, bound, settings_path):
     from sftlib.sequence import ChildStop
     selected = saved_pilot(root)
+    if not schedule.enabled(bound):
+        message("Resuming LEGACY independent-budget grid unchanged; continuous trajectories require a new grid root.")
     # Full measured forecast is printed before ANY grid cell is started.
     forecast = reporting.estimate(root, selected, bound["settings"])
     atomic_json(root / "estimate.json", forecast)
@@ -209,6 +227,8 @@ def run(root, bound, settings_path):
             return
         if not ensure_evaluation(root, bound, None, selected, runner):
             return
+        if schedule.enabled(bound):
+            return run_trajectories(root, bound, selected, runner, stop)
         for index, item in enumerate(cells(), 1):
             if stop.requested:
                 break
@@ -225,3 +245,32 @@ def run(root, bound, settings_path):
         result = reporting.summary(root)
         atomic_json(root / "status.json", {"status": "complete" if result["complete_cells"] == 25 else "paused",
                                          "complete_cells": result["complete_cells"]})
+
+
+def run_trajectories(root, bound, selected, runner, stop):
+    """Resume each mixture's single full-state trajectory between evaluated prefixes."""
+    for trajectory in schedule.trajectories():
+        for nominal in schedule.EVALUATION_POINTS:
+            if stop.requested:
+                break
+            item = schedule.milestone(trajectory["on_policy_percent"], nominal)
+            message(f"Trajectory {trajectory['id']} · milestone {nominal:,} nominal points "
+                    f"({item['points']:,} actual; update {item['updates']:,})")
+            if not check_completed_training(root, bound, item, selected):
+                if not train_with_recovery(root, trajectory, selected, runner, until_points=nominal):
+                    break
+                if not check_completed_training(root, bound, item, selected):
+                    break
+            if not ensure_evaluation(root, bound, item, selected, runner):
+                break
+            reporting.summary(root)
+        else:
+            continue
+        break
+    result = reporting.summary(root)
+    atomic_json(root / "status.json", {
+        "status": "complete" if result["complete_cells"] == len(schedule.milestones()) else "paused",
+        "training_design": schedule.DESIGN, "complete_cells": result["complete_cells"],
+        "complete_milestones": result["complete_cells"],
+        "complete_trajectories": result["complete_trajectories"],
+    })

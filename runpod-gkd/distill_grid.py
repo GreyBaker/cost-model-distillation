@@ -33,6 +33,7 @@ def main():
         worker.add_argument("--online", type=int, choices=[0, 1])
         worker.add_argument("--output", type=Path)
         worker.add_argument("--session-updates", type=int)
+        worker.add_argument("--until-points", type=int)
         worker.add_argument("--attempt-result", type=Path)
     args = parser.parse_args()
     operation = args.command or "plan"
@@ -67,6 +68,12 @@ def main():
             print("Verified validated external pair; no model loaded or GPU used."
                   if bound["inputs"].get("kind") == "validated-external-pair-v1"
                   else "Verified completed 100K/8K SFT pair; no model loaded or GPU used.")
+            if "training_design" in bound:
+                print("Continuous design: five mixtures, 2,560,000 nominal points each; "
+                      "45 retained/evaluated milestones, rolling recovery every 5,000 points.")
+            else:
+                print("Existing LEGACY independent-budget grid preserved. Use a NEW grid work directory "
+                      "to adopt continuous trajectories; never edit the old binding.")
         elif operation == "audit":
             from gridlib.audit import audit
             result = audit(root, bound)
@@ -110,7 +117,10 @@ def main():
             from gridlib.controller import saved_pilot
             from gridlib.recovery import (OOM_EXIT_CODE, evaluation_microbatch, training_microbatch)
             selected = saved_pilot(root)
-            item = next((x for x in policy.cells() if x["id"] == args.cell), None)
+            from gridlib import schedule
+            candidates = (schedule.trajectories() if operation == "_train" else schedule.milestones()) \
+                if schedule.enabled(bound) else policy.cells()
+            item = next((x for x in candidates if x["id"] == args.cell), None)
             if item is None and not (operation == "_evaluate" and args.cell == "baseline"):
                 raise ValueError("Explicit grid cell required")
             if args.attempt_result is not None and not args.attempt_result.resolve().is_relative_to(root / "attempts"):
@@ -125,13 +135,14 @@ def main():
                     from gridlib.engine import train
                     if args.session_updates is not None and args.session_updates < 1:
                         raise ValueError("Session pilot update cap must be positive")
-                    train(root, bound, item, selected, args.session_updates, microbatch=actual_batch)
+                    train(root, bound, item, selected, args.session_updates, microbatch=actual_batch,
+                          until_points=args.until_points)
                 else:
                     from gridlib.evaluation import evaluate
                     if args.output is None:
                         raise ValueError("Explicit evaluation output required")
                     output = args.output.resolve()
-                    owner = root / "cells" / item["id"] if item else root / "baseline"
+                    owner = schedule.evaluation_directory(root, item)
                     if not output.is_relative_to(owner):
                         raise ValueError("Evaluation must stay within its own cell/baseline directory")
                     evaluate(root, bound, item, selected, output)

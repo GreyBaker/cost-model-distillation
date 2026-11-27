@@ -2,13 +2,14 @@
 from __future__ import annotations
 
 import argparse
-from fractions import Fraction
 import json
 from pathlib import Path, PurePosixPath
 import re
 import sys
 
 ROOT = Path(__file__).resolve().parent
+sys.path.insert(0, str(ROOT.parent / "runpod-gkd"))
+from gridlib import schedule
 
 
 def read(path):
@@ -28,7 +29,10 @@ def validate(scheme, locked):
     require(scheme["compatibility"]["grid_smoke_update_and_resume_required"] is False,
             "Disposable GKD smoke/restart checks are development-only")
     grid = scheme["grid"]
-    require(grid["budgets"] == [500, 1000, 5000, 10000, 50000], "Grid budgets changed")
+    require(grid["evaluation_points"] == list(schedule.EVALUATION_POINTS), "Grid milestones changed")
+    require(grid["final_points"] == schedule.FINAL_POINTS
+            and grid["recovery_every_points"] == schedule.RECOVERY_POINTS,
+            "Continuous trajectory/recovery horizon changed")
     require(grid["on_policy_percentages"] == [0, 25, 50, 75, 100], "Grid mixture axis changed")
     require(grid["effective_batch"] == 32, "Grid batch must stay 32, not teacher SFT batch128")
     require(grid["off_policy_point_cost"] == 1 and grid["on_policy_point_cost"] == 2, "Point costs changed")
@@ -63,23 +67,7 @@ def validate(scheme, locked):
 
 
 def grid_cells(grid):
-    cells = []
-    for budget in grid["budgets"]:
-        for percent in grid["on_policy_percentages"]:
-            fraction = Fraction(percent, 100)
-            online, group = fraction.numerator, fraction.denominator
-            cost = group + online
-            groups = budget // cost
-            per_update = grid["effective_batch"] // group
-            cells.append({
-                "budget_points": budget, "on_policy_percent": percent,
-                "points": groups * cost, "examples": groups * group,
-                "on_policy_examples": groups * online,
-                "off_policy_examples": groups * (group - online),
-                "updates": (groups + per_update - 1) // per_update,
-                "unspent_points": budget % cost,
-            })
-    return cells
+    return schedule.milestones()
 
 
 def build(student="restored"):
@@ -111,10 +99,11 @@ def build(student="restored"):
         "existing_joint_training_fit_pilot",
         "existing_once_only_student_inference_calibration_and_full_baseline",
         "print_measured_estimate_and_wait_for_grid_approval",
-        "run_all_25_cells_independently_from_fixed_fp32_student",
+        "train_5_continuous_mixtures_with_45_retained_evaluated_prefixes",
         "audit_hashes_points_predictions_and_download_outputs",
     ]
     cells = grid_cells(scheme["grid"])
+    trajectories = schedule.trajectories()
     selected = locked["models"]["public_student"] if student == "public" else {
         "kind": "restored_local_sft", "source": scheme["storage"]["restored_student_source"],
         "pin": "verify the complete copied role, original run, checkpoint/export/data/evaluation hashes",
@@ -127,10 +116,11 @@ def build(student="restored"):
         "student_mode": student, "student": selected,
         "local_sft_updates": 0, "periodic_greedy_monitor": False,
         "native_transformers": scheme["runtime"]["grid_transformers"],
-        "stages": stages, "grid_cells": cells,
+        "stages": stages, "grid_cells": cells, "training_design": schedule.DESIGN,
+        "grid_trajectories": trajectories,
         "development": {"smoke_command": "external_teacher.py dev-smoke", "included_in_standard_run": False},
-        "grid_totals": {"cells": len(cells), **{
-            key: sum(item[key] for item in cells) for key in
+        "grid_totals": {"cells": len(cells), "training_trajectories": len(trajectories), **{
+            key: sum(item[key] for item in trajectories) for key in
             ("points", "examples", "on_policy_examples", "off_policy_examples", "updates", "unspent_points")}},
         "implementation_required": [],
         "warning": "Use external_teacher.py run in the isolated native environment, not the local-SFT pipeline. "

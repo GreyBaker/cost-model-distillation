@@ -27,6 +27,10 @@ def verify(output, identity):
 def source(root, bound, item):
     if item is None:
         directory = Path(bound["inputs"]["paths"]["student_checkpoint"])
+    elif "trajectory_id" in item:
+        from .controller import saved_pilot
+        from .milestones import verify
+        directory, _ = verify(root, bound, item, saved_pilot(root))
     else:
         run_dir = root / "cells" / item["id"]
         result = read_json(run_dir / "training_summary.json")

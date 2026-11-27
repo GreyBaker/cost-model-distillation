@@ -33,6 +33,11 @@ def select_pilot(results, candidates):
 
 
 def estimate(root, selected, settings):
+    from . import schedule
+    bound_path = root / "binding.json"
+    if bound_path.exists() and schedule.enabled(read_json(bound_path)):
+        from .trajectory_reporting import estimate as trajectory_estimate
+        return trajectory_estimate(root, selected, settings)
     baseline_pointer = root / "baseline" / "latest_evaluation.json"
     if not baseline_pointer.is_file():
         raise ValueError("Finish the pilot's full baseline evaluation before estimating the grid")
@@ -101,6 +106,9 @@ def records(path):
 
 
 def summary(root):
+    from . import schedule
+    bound_path = root / "binding.json"
+    continuous = bound_path.exists() and schedule.enabled(read_json(bound_path))
     stages = records(root / "stages.jsonl")
     baseline_metrics = {}
     baseline_pointer = root / "baseline/latest_evaluation.json"
@@ -111,18 +119,26 @@ def summary(root):
                 "evaluation_seconds": baseline_metrics.get("evaluation_seconds"),
                 "scores": baseline_metrics.get("scores", {})}
     rows = []
-    for item in cells():
-        run_dir = root / "cells" / item["id"]
-        training_path = run_dir / "training_summary.json"
+    for item in (schedule.milestones() if continuous else cells()):
+        run_dir = schedule.evaluation_directory(root, item)
+        training_owner = root / "trajectories" / item["trajectory_id"] if continuous else run_dir
+        training_path = run_dir / ("snapshot.json" if continuous else "training_summary.json")
         training = read_json(training_path) if training_path.exists() else {}
+        if continuous and training:
+            training = {**training["accounting"], "status": "complete",
+                        "microbatch": read_json(run_dir / "checkpoint/metadata.json")
+                        .get("execution_config", {}).get("microbatch")}
         evaluation = {}
         pointer = run_dir / "latest_evaluation.json"
         if pointer.exists():
             evaluation = read_json(Path(read_json(pointer)["path"]) / "metrics.json")
-        events = [event for path in sorted((run_dir / "sessions").glob("*.jsonl")) for event in records(path)]
+        events = [event for path in sorted((training_owner / "sessions").glob("*.jsonl")) for event in records(path)
+                  if not continuous or event.get("step", 0) <= item["updates"]]
         batch_sessions = [event["microbatch"] for event in sorted(events, key=lambda e: e.get("unix_time", 0))
                           if event["event"] == "initialized" and "microbatch" in event]
-        own_stages = [x for x in stages if x["cell"] == item["id"]]
+        own_stages = [x for x in stages if x["cell"] == item["id"] or
+                      (continuous and x["cell"] == item["trajectory_id"]
+                       and x.get("until_points") == item["budget_points"])]
         train_wall = sum(x["seconds"] for x in own_stages if x["operation"] == "train")
         eval_wall = sum(x["seconds"] for x in own_stages if x["operation"] == "evaluate")
         status = training.get("status", "pending")
@@ -172,6 +188,22 @@ def summary(root):
                                   "Shared pilot/baseline/controller overhead is separate; evaluation_pilot_wall_seconds "
                                   "is a component of shared_stage_wall_seconds, not an additional cost. "
                                   "Killed controllers may leave unmeasured stages."}
+    if continuous:
+        result["training_design"] = schedule.DESIGN
+        result["complete_milestones"] = result["complete_cells"]
+        result["complete_trajectories"] = sum(
+            all(row["status"] == "complete" for row in rows if row["on_policy_percent"] == percent)
+            for percent in schedule.PERCENTAGES)
+        result["committed_training_seconds"] = sum(
+            read_json(path)["training_seconds"] for item in schedule.trajectories()
+            if (path := schedule.training_directory(root, item) / "training_summary.json").exists())
+        result["recorded_training_stage_wall_seconds"] = sum(
+            event["seconds"] for event in stages if event["operation"] == "train")
+        result["time_accounting"] += (
+            " Milestone training_seconds and example/update/token counts are CUMULATIVE prefixes "
+            "of one trajectory per mixture; DO NOT sum them across milestones. "
+            "committed_training_seconds counts each trajectory once. "
+            "Row training_wall_seconds covers only that milestone's incremental training stage.")
     atomic_json(root / "summary.json", result)
     buffer = io.StringIO(newline="")
     writer = csv.DictWriter(buffer, fieldnames=list(rows[0]))
