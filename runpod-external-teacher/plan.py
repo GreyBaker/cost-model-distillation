@@ -29,7 +29,11 @@ def validate(scheme, locked):
     require(scheme["compatibility"]["grid_smoke_update_and_resume_required"] is False,
             "Disposable GKD smoke/restart checks are development-only")
     grid = scheme["grid"]
+    require(grid["training_design"] == schedule.DESIGN["kind"], "Grid/LR recipe changed")
+    for key in ("lr_horizon", "lr_warmup_points", "lr_cooldown_begin_points", "lr_cooldown_end_points"):
+        require(grid[key] == schedule.DESIGN[key], "Grid LR schedule changed")
     require(grid["evaluation_points"] == list(schedule.EVALUATION_POINTS), "Grid milestones changed")
+    require(grid["default_end_points"] == schedule.DEFAULT_END_POINTS, "Default campaign endpoint changed")
     require(grid["final_points"] == schedule.FINAL_POINTS
             and grid["recovery_every_points"] == schedule.RECOVERY_POINTS,
             "Continuous trajectory/recovery horizon changed")
@@ -67,7 +71,7 @@ def validate(scheme, locked):
 
 
 def grid_cells(grid):
-    return schedule.milestones()
+    return schedule.active_milestones(grid["default_end_points"])
 
 
 def build(student="restored"):
@@ -99,11 +103,11 @@ def build(student="restored"):
         "existing_joint_training_fit_pilot",
         "existing_once_only_student_inference_calibration_and_full_baseline",
         "print_measured_estimate_and_wait_for_grid_approval",
-        "train_5_continuous_mixtures_with_45_retained_evaluated_prefixes",
+        "train_5_continuous_mixtures_through_160k_with_25_retained_evaluated_prefixes",
         "audit_hashes_points_predictions_and_download_outputs",
     ]
     cells = grid_cells(scheme["grid"])
-    trajectories = schedule.trajectories()
+    trajectories = [schedule.milestone(percent, schedule.DEFAULT_END_POINTS) for percent in schedule.PERCENTAGES]
     selected = locked["models"]["public_student"] if student == "public" else {
         "kind": "restored_local_sft", "source": scheme["storage"]["restored_student_source"],
         "pin": "verify the complete copied role, original run, checkpoint/export/data/evaluation hashes",
@@ -118,6 +122,7 @@ def build(student="restored"):
         "native_transformers": scheme["runtime"]["grid_transformers"],
         "stages": stages, "grid_cells": cells, "training_design": schedule.DESIGN,
         "grid_trajectories": trajectories,
+        "campaign": schedule.campaign(),
         "development": {"smoke_command": "external_teacher.py dev-smoke", "included_in_standard_run": False},
         "grid_totals": {"cells": len(cells), "training_trajectories": len(trajectories), **{
             key: sum(item[key] for item in trajectories) for key in

@@ -6,27 +6,32 @@ from fractions import Fraction
 from functools import lru_cache
 import math
 
-FINAL_POINTS = 2_560_000
-EVALUATION_POINTS = (10_000, 20_000, 40_000, 80_000, 160_000,
-                     320_000, 640_000, 1_280_000, FINAL_POINTS)
+FINAL_POINTS = 160_000
+DEFAULT_END_POINTS = FINAL_POINTS
+# This is a new training recipe, not a truncation of the old 2.56M LR schedule.
+EVALUATION_POINTS = (10_000, 20_000, 40_000, 80_000, FINAL_POINTS)
 RECOVERY_POINTS = 5_000
 PERCENTAGES = (0, 25, 50, 75, 100)
 DESIGN = {
-    "kind": "continuous-point-milestones-v1",
+    "kind": "continuous-point-milestones-v2",
     "final_points": FINAL_POINTS,
     "evaluation_points": list(EVALUATION_POINTS),
     "recovery_every_points": RECOVERY_POINTS,
     "recovery_retention": 2,
     "boundary_policy": "complete_exact_mixture_groups_at_or_below_nominal_points",
     "update_policy": "batch_32_except_short_update_at_recovery_boundary",
-    "lr_horizon": "full_trajectory_spendable_points",
+    "lr_horizon": "nominal_trajectory_points",
+    "lr_warmup_points": 8_000,
+    "lr_cooldown_begin_points": 120_000,
+    "lr_cooldown_end_points": FINAL_POINTS,
 }
 
 
 def require_design(bound):
     if bound.get("training_design") != DESIGN:
-        raise ValueError("Unsupported grid design. Only continuous-point-milestones-v1 is supported; "
-                         "preserve old results and use a NEW grid directory.")
+        raise ValueError("Unsupported grid/LR recipe. The 160K horizon (8K warmup, 120K–160K cooldown) "
+                         "requires continuous-point-milestones-v2; long-horizon checkpoints cannot be relabeled. "
+                         "Preserve old results and use a NEW grid directory; approved pairs remain reusable.")
 
 
 def validate_root(root, *, allow_new=False):
@@ -145,6 +150,28 @@ def milestones():
     return [milestone(percent, nominal) for percent in PERCENTAGES for nominal in EVALUATION_POINTS]
 
 
+def evaluation_points(end_points=DEFAULT_END_POINTS):
+    """Operational scope, deliberately NOT part of immutable training identity."""
+    if type(end_points) is not int or end_points not in EVALUATION_POINTS:
+        raise ValueError("Endpoint must be one of the declared evaluation milestones")
+    return tuple(point for point in EVALUATION_POINTS if point <= end_points)
+
+
+def active_milestones(end_points=DEFAULT_END_POINTS):
+    return [milestone(percent, nominal) for percent in PERCENTAGES
+            for nominal in evaluation_points(end_points)]
+
+
+def campaign(end_points=DEFAULT_END_POINTS):
+    return {"end_points": end_points, "evaluation_points": list(evaluation_points(end_points)),
+            "lr_horizon_nominal_points": FINAL_POINTS,
+            "lr_warmup_points": DESIGN["lr_warmup_points"],
+            "lr_cooldown_begin_points": DESIGN["lr_cooldown_begin_points"],
+            "lr_cooldown_end_points": FINAL_POINTS,
+            "extension_policy": "full-state endpoint retained; beyond 160K requires an explicit new LR stage",
+            "resume_policy": "same full-state trajectory; skip mixtures already beyond endpoint"}
+
+
 def training_directory(root, item):
     require_trajectory(item)
     return root / "trajectories" / item["id"]
@@ -157,20 +184,24 @@ def evaluation_directory(root, item):
     return root / "milestones" / item["id"]
 
 
-def plan():
+def plan(end_points=DEFAULT_END_POINTS):
     from .policy import PROTOCOL, VALIDATION_N
-    runs = trajectories()
+    scope = campaign(end_points)
+    runs = [milestone(percent, end_points) for percent in PERCENTAGES]
+    selected = active_milestones(end_points)
     return {
         "operation": "read-only plan; no ML, network, GPU or training",
-        "protocol": PROTOCOL, "training_design": DESIGN,
-        "trajectories": runs, "milestones": milestones(),
+        "protocol": PROTOCOL, "training_design": DESIGN, "campaign": scope,
+        "trajectories": runs, "milestones": selected,
+        "full_horizon_trajectories": trajectories(),
         "totals": {key: sum(row[key] for row in runs)
                    for key in ("budget_points", "points", "examples", "on_policy_examples",
                                "off_policy_examples", "updates", "unspent_points")},
-        "training_trajectories": len(runs), "retained_evaluated_checkpoints": len(milestones()),
-        "validation_generations_including_baseline": VALIDATION_N * (len(milestones()) + 1),
-        "storage": "One disposable Pod disk; 45 permanent full-state milestone checkpoints plus "
-                   "two rolling restart checkpoints per mixture, transient saves, models and data.",
+        "training_trajectories": len(runs), "retained_evaluated_checkpoints": len(selected),
+        "validation_generations_including_baseline": VALIDATION_N * (len(selected) + 1),
+        "storage": f"One disposable Pod disk; {len(selected)} permanent full-state milestone checkpoints plus "
+                   "two rolling restart checkpoints per mixture, transient saves, models and data. "
+                   "Existing later artifacts are preserved and need additional space.",
         "warning": "Milestones are correlated prefixes, not independent budget runs. "
                    "Training costs are counted once per mixture, not once per evaluation.",
     }

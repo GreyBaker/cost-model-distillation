@@ -31,15 +31,31 @@ class SchemeTests(unittest.TestCase):
 
     def test_grid_totals_count_continuous_training_once_not_each_prefix(self):
         totals = plan.build()["grid_totals"]
-        self.assertEqual(totals["cells"], 45)
+        self.assertEqual(totals["cells"], 25)
         self.assertEqual(totals["training_trajectories"], 5)
         # Cross-check actual existing engine policy, not just copied constants.
         sys.path.insert(0, str(plan.ROOT.parent / "runpod-gkd"))
         from gridlib import schedule
-        self.assertEqual(plan.build()["grid_cells"], schedule.milestones())
-        self.assertEqual(plan.build()["grid_trajectories"], schedule.trajectories())
+        self.assertEqual(plan.build()["grid_cells"], schedule.active_milestones())
+        self.assertEqual(plan.build()["grid_trajectories"],
+                         [schedule.milestone(p, 160000) for p in schedule.PERCENTAGES])
         for key in ("points", "examples", "updates", "unspent_points"):
-            self.assertEqual(totals[key], sum(item[key] for item in schedule.trajectories()))
+            self.assertEqual(totals[key], sum(schedule.milestone(p, 160000)[key] for p in schedule.PERCENTAGES))
+        campaign = plan.build()["campaign"]
+        self.assertEqual((campaign["lr_horizon_nominal_points"], campaign["lr_warmup_points"],
+                          campaign["lr_cooldown_begin_points"], campaign["lr_cooldown_end_points"]),
+                         (160000, 8000, 120000, 160000))
+
+    def test_wrong_lr_recipe_is_rejected(self):
+        locked = plan.read(plan.ROOT / "models.lock.json")
+        for key, value in (("training_design", "continuous-point-milestones-v1"),
+                           ("lr_horizon", "full_trajectory_spendable_points"),
+                           ("lr_warmup_points", 16000), ("lr_cooldown_begin_points", 240000),
+                           ("lr_cooldown_end_points", 320000)):
+            changed = plan.read(plan.ROOT / "scheme.json")
+            changed["grid"][key] = value
+            with self.subTest(key=key), self.assertRaisesRegex(ValueError, "Grid.*(recipe|schedule) changed"):
+                plan.validate(changed, locked)
 
     def test_all_approvals_precede_grid_training(self):
         stages = plan.build()["stages"]
@@ -51,7 +67,7 @@ class SchemeTests(unittest.TestCase):
         self.assertEqual(plan.build()["development"], {
             "smoke_command": "external_teacher.py dev-smoke", "included_in_standard_run": False})
         self.assertLess(stages.index("print_measured_estimate_and_wait_for_grid_approval"),
-                        stages.index("train_5_continuous_mixtures_with_45_retained_evaluated_prefixes"))
+                         stages.index("train_5_continuous_mixtures_through_160k_with_25_retained_evaluated_prefixes"))
 
     def test_pins_weights_and_equal_public_tokenizer_file_identities(self):
         locked = plan.read(plan.ROOT / "models.lock.json")

@@ -49,9 +49,9 @@ def train(root, bound, item, selected, session_updates=None, microbatch=None, un
     if type(microbatch) is not int or not 1 <= microbatch <= selected["microbatch"] or 32 % microbatch:
         raise ValueError("Microbatch must be a positive divisor of 32 no larger than the original pilot selection")
     run_dir = schedule.training_directory(root, item)
-    target_step = item["updates"]
-    if until_points is not None:
-        target_step = schedule.milestone(item["on_policy_percent"], until_points)["updates"]
+    target = schedule.milestone(item["on_policy_percent"],
+                               schedule.DEFAULT_END_POINTS if until_points is None else until_points)
+    target_step = target["updates"]
     run_file = run_dir / "run.json"
     value = {"cell": item, "microbatch": selected["microbatch"], "settings": settings,
              "protocol": PROTOCOL}
@@ -63,8 +63,11 @@ def train(root, bound, item, selected, session_updates=None, microbatch=None, un
         if run["config"] != value or run["signatures"] != signatures:
             raise ValueError("Cell configuration/pilot/input identity changed")
         # Never silently restart an initialized cell that has no complete restart.
-        checkpoint = checkpoints.resolve(run_dir)
-        marker = checkpoints.verify(checkpoint, run["run_id"])
+        from .milestones import latest_restart
+        checkpoint, marker = latest_restart(root, bound, item, selected)
+        if marker["step"] > target_step:
+            message(f"{item['id']} already exceeds requested endpoint; leaving checkpoints unchanged.")
+            return
     else:
         if run_dir.exists():
             raise FileExistsError(f"Inspect nonempty/unowned cell directory: {run_dir}")
@@ -111,30 +114,30 @@ def train(root, bound, item, selected, session_updates=None, microbatch=None, un
                      "microbatch": microbatch, "effective_batch_size": 32})
     last_saved = state["step"] if checkpoint else -1
     start_step = state["step"]
-    bar = progress(item["points"], initial=state["points"], desc=f"GKD {item['id']}", unit="pt")
+    bar = progress(target["points"], initial=state["points"], desc=f"GKD {item['id']}", unit="pt")
 
     def save(reason):
-        nonlocal last_saved
+        nonlocal last_saved, checkpoint
         if last_saved == state["step"]:
             from .milestones import retain
-            retain(root, bound, item, selected, checkpoints.resolve(run_dir), state)
+            retain(root, bound, item, selected, checkpoint, state)
             return
         before = time.monotonic()
-        checkpoints.save(run_dir, student, tokenizer,
-                         {"step": state["step"], "accounting": dict(state),
-                          "optimizer": opt.state_dict(), "rng": rng_state(),
-                           "branch_rng": branch_rng.getstate(),
-                           "execution_config": {**value, "microbatch": microbatch}}, reason)
+        checkpoint = checkpoints.save(run_dir, student, tokenizer,
+                                      {"step": state["step"], "accounting": dict(state),
+                                       "optimizer": opt.state_dict(), "rng": rng_state(),
+                                       "branch_rng": branch_rng.getstate(),
+                                       "execution_config": {**value, "microbatch": microbatch}}, reason)
         last_saved = state["step"]
         from .milestones import retain
-        retain(root, bound, item, selected, checkpoints.resolve(run_dir), state)
+        retain(root, bound, item, selected, checkpoint, state)
         append(session, {"event": "checkpoint", "step": last_saved,
                          "seconds": time.monotonic() - before})
         message(f"{item['id']} checkpoint saved: update {last_saved:,}, "
-                f"{state['points']:,}/{item['points']:,} points.")
+                f"{state['points']:,}/{target['points']:,} points (160K LR horizon).")
         atomic_json(run_dir / "training_summary.json",
                     {"status": "paused", "cell": item, **state,
-                     "checkpoint": str(checkpoints.resolve(run_dir)),
+                     "checkpoint": str(checkpoint),
                      "initial_student": run["initial_student"], "signatures": signatures,
                      "microbatch": microbatch})
 
@@ -143,8 +146,6 @@ def train(root, bound, item, selected, session_updates=None, microbatch=None, un
         with StopRequest() as stop:
             # A failed first update can resume from an owned zero-update restart.
             save("initial state")
-            if state["step"] > target_step:
-                raise ValueError("Cannot reconstruct an earlier missing milestone from later weights")
             recovery_steps = set(schedule.boundary_steps(item["on_policy_percent"]))
             while state["step"] < target_step and not stop.requested:
                 spec = update_spec(item, state["step"])
@@ -155,7 +156,7 @@ def train(root, bound, item, selected, session_updates=None, microbatch=None, un
                 flags = [True] * spec["on"] + [False] * spec["off"]
                 branch_rng.shuffle(flags)
                 batches = chunks(rows, flags, microbatch, branch_rng)
-                rate = settings["learning_rate"] * lr_factor(state["points"], spec["points"], item["points"])
+                rate = settings["learning_rate"] * lr_factor(state["points"], spec["points"], item["budget_points"])
                 for group in opt.param_groups:
                     group["lr"] = rate
                 result = backend.update(student, teacher, tokenizer, opt, batches, len(rows), device)
@@ -173,7 +174,7 @@ def train(root, bound, item, selected, session_updates=None, microbatch=None, un
                                  "on": spec["on"], "off": spec["off"], "learning_rate": rate,
                                  "microbatch": microbatch, "microbatches": len(batches), **result})
                 bar.set_postfix(loss=f"{result['loss']:.4f}", lr=f"{rate:.2g}",
-                                update=f"{state['step']}/{item['updates']}", mb=microbatch,
+                                update=f"{state['step']}/{target_step}", mb=microbatch,
                                 VRAM=f"{result.get('peak_allocated_bytes', 0) / 1024**3:.1f}GiB",
                                 train=duration(state["training_seconds"]), refresh=False)
                 bar.update(spec["points"])
@@ -188,7 +189,9 @@ def train(root, bound, item, selected, session_updates=None, microbatch=None, un
         status = "complete" if state["step"] == item["updates"] else "paused"
         atomic_json(run_dir / "training_summary.json",
                     {"status": status, "cell": item, **state,
-                     "checkpoint": str(checkpoints.resolve(run_dir)),
+                     "checkpoint": str(checkpoint),
+                     "requested_end_points": target["budget_points"],
+                     "target_reached": state["step"] == target_step,
                      "initial_student": run["initial_student"], "signatures": signatures,
                      "microbatch": microbatch})
     except BaseException as error:

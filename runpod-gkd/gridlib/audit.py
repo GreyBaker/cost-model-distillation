@@ -9,6 +9,7 @@ from . import evaluation
 from .controller import check_completed_training, saved_pilot
 from .policy import VALIDATION_N
 from .shared import read_json
+from . import schedule
 
 
 def prediction_audit(output, expected=None, expected_n=VALIDATION_N):
@@ -47,25 +48,41 @@ def prediction_audit(output, expected=None, expected_n=VALIDATION_N):
     return ids
 
 
-def audit(root, bound):
-    from . import schedule
+def audit(root, bound, end_points=schedule.DEFAULT_END_POINTS):
     schedule.require_design(bound)
     selected = saved_pilot(root)
     baseline = Path(read_json(root / "baseline/latest_evaluation.json")["path"])
     evaluation.verify(baseline, evaluation.identity(root, bound, None, selected))
     expected = prediction_audit(baseline)
-    verified = []
-    for item in schedule.milestones():
+    from .milestones import latest_restart
+    progress, skipped_trajectories = {}, []
+    for trajectory in schedule.trajectories():
+        _, marker = latest_restart(root, bound, trajectory, selected)
+        progress[trajectory["id"]] = marker["step"] if marker else 0
+        if progress[trajectory["id"]] > schedule.milestone(trajectory["on_policy_percent"], end_points)["updates"]:
+            skipped_trajectories.append(trajectory["id"])
+    verified, skipped = [], []
+    for item in schedule.active_milestones(end_points):
+        if item["trajectory_id"] in skipped_trajectories:
+            skipped.append({"cell": item["id"], "reason": "trajectory already beyond active endpoint"})
+            continue
         if not check_completed_training(root, bound, item, selected):
+            if progress[item["trajectory_id"]] > item["updates"]:
+                skipped.append({"cell": item["id"], "reason": "no retained snapshot before current checkpoint"})
+                continue
             raise ValueError(f"Incomplete cell: {item['id']}")
         owner = schedule.evaluation_directory(root, item)
         output = Path(read_json(owner / "latest_evaluation.json")["path"])
         evaluation.verify(output, evaluation.identity(root, bound, item, selected))
         prediction_audit(output, expected)
         verified.append(item["id"])
-    return {"status": "pass", "cells": verified, "validation_n": VALIDATION_N,
+    return {"status": "pass_with_skips" if skipped else "pass", "cells": verified, "validation_n": VALIDATION_N,
+            "campaign": schedule.campaign(end_points), "skipped": skipped,
+            "skipped_trajectories": skipped_trajectories,
             "training_design": schedule.DESIGN,
             "checks": ["immutable common initialization", "final checkpoint/evaluation hashes",
                        "point and exact-mixture counts", "exact validation ID/reference agreement",
                        "no duplicates", "reaggregated saved score means/counters", "EOS/cap/empty flags"],
-            "limitations": "Does not recompute ROUGE from text or establish real-ML restart equivalence/seed robustness."}
+            "limitations": "Does not recompute ROUGE from text or establish real-ML restart equivalence/seed robustness. "
+                           "Skipped items have no evaluation coverage/score audit; only their latest restart "
+                           "bytes and recipe are verified. Campaign completion is not full-horizon completion."}

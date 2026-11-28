@@ -97,6 +97,8 @@ def definition(args):
 
 def storage_projection(value):
     """Conservative remaining-space estimate from pinned sizes, not a fit claim."""
+    from gridlib import schedule
+    milestone_count = len(schedule.active_milestones())
     locked = read_json(ROOT / "models.lock.json")
     specs = [locked["models"]["teacher"], locked["evaluation_data"]]
     if value["student"] == "public":
@@ -116,7 +118,7 @@ def storage_projection(value):
         # Conservative optimizer upper allowance: another full model per state,
         # though factored Adafactor typically needs substantially less.
         "grid_5_trajectories_two_rolling_restarts_each": 5 * 2 * 2 * student_bytes,
-        "grid_45_permanent_full_state_milestones": 45 * 2 * student_bytes,
+        f"grid_{milestone_count}_permanent_full_state_milestones": milestone_count * 2 * student_bytes,
         "grid_pilot_and_transient_checkpoints": 10 * student_bytes,
         "prepared_tables_and_data_caches_allowance": 10 * 1024 ** 3,
         "reports_and_miscellaneous_reserve": 5 * 1024 ** 3,

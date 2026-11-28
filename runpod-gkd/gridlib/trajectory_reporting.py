@@ -8,8 +8,9 @@ from . import schedule
 from .shared import read_json, sha256
 
 
-def estimate(root, selected, settings):
+def estimate(root, selected, settings, end_points=schedule.DEFAULT_END_POINTS):
     schedule.validate_root(root)
+    scope = schedule.campaign(end_points)
     from .evaluation import verify
     from .policy import VALIDATION_N
     from .recovery import training_microbatch
@@ -30,21 +31,24 @@ def estimate(root, selected, settings):
          - selected[key]["resumed_update"]["training_seconds"]) / 2
         for key in ("off_policy", "on_policy")))
     rows = []
-    for item in schedule.trajectories():
+    for percent in schedule.PERCENTAGES:
+        item = schedule.milestone(percent, end_points)
         seconds, previous_groups = 0.0, 0
-        for _, groups, _ in schedule.boundaries(item["on_policy_percent"]):
+        boundaries = [row for row in schedule.boundaries(percent) if row[0] <= end_points]
+        for _, groups, _ in boundaries:
             full, short = divmod(groups - previous_groups, item["groups_per_update"])
             for count, multiplicity in ((item["groups_per_update"], full), (short, int(short > 0))):
                 online = count * item["group_online"]
                 offline = count * (item["group_size"] - item["group_online"])
                 seconds += multiplicity * (math.ceil(offline / mb) * off + math.ceil(online / mb) * on)
             previous_groups = groups
-        n = len(schedule.EVALUATION_POINTS)
-        saves = 1 + len(schedule.boundaries(item["on_policy_percent"]))
+        n = len(schedule.evaluation_points(end_points))
+        saves = 1 + len(boundaries)
         # A separate independent full-state copy for each retained milestone.
         checkpoint_seconds = (saves + n) * save_time
         rows.append({
-            "cell": item["id"], "trajectory": item["id"], "points": item["points"], "updates": item["updates"],
+            "cell": item["trajectory_id"], "trajectory": item["trajectory_id"],
+            "points": item["points"], "updates": item["updates"],
             "recovery_saves_including_initial": saves, "retained_checkpoints": n,
             "evaluations": n, "estimated_training_seconds": seconds,
             "estimated_checkpoint_seconds": checkpoint_seconds,
@@ -55,7 +59,7 @@ def estimate(root, selected, settings):
     active = training_microbatch(root, selected)
     return {
         "basis": "Measured fit pilot and common full validation; each continuous mixture trained ONCE",
-        "training_design": schedule.DESIGN, "trajectories": rows,
+        "training_design": schedule.DESIGN, "campaign": scope, "trajectories": rows,
         "pilot_sha256": sha256(root / "pilot.json"),
         "pilot_microbatch": mb, "active_training_microbatch": active,
         "evaluation_pilot_batch": read_json(root / "evaluation_pilot.json")["batch_size"],

@@ -7,6 +7,7 @@ import io
 from pathlib import Path
 import pickle
 import random
+import shutil
 import sys
 import tempfile
 from types import SimpleNamespace
@@ -16,7 +17,7 @@ from unittest.mock import patch
 sys.dont_write_bytecode = True
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from gridlib import (backend, controller, engine, evaluation, inputs, milestones,
-                     policy, recovery, reporting, schedule, trajectory_reporting)
+                     policy, recovery, reporting, schedule, trajectory_reporting, audit)
 from gridlib.shared import atomic_json, checkpoints, read_json, sha256, tree_manifest
 from sftlib import training
 import distill_grid
@@ -88,15 +89,80 @@ def fake_training(root):
         yield bound, selected, calls, loads
 
 
+def seed_checkpoint(root, bound, selected, percent, nominal):
+    """Development-only synthetic history, never used by the real workflow."""
+    item = schedule.trajectory(percent)
+    owner = schedule.training_directory(root, item)
+    config = controller.training_config(bound, item, selected)
+    signatures = {"binding_sha256": sha256(root / "binding.json"),
+                  "pilot_sha256": sha256(root / "pilot.json")}
+    atomic_json(owner / "run.json", {"run_id": f"fixture-{percent}", "config": config,
+                "signatures": signatures, "runtime": selected["runtime"],
+                "initial_student": "original-fp32"})
+    step = schedule.boundaries(percent)[nominal // 5000 - 1][2]
+    state = {**engine.new_state(), **schedule.accounting(item, step)}
+    return checkpoints.save(owner, Model(step), SimpleNamespace(save_pretrained=lambda p: None), {
+        "step": step, "accounting": state, "optimizer": {"count": step},
+        "rng": random.Random(17).getstate(), "branch_rng": random.Random(19).getstate(),
+        "execution_config": config}, "synthetic test prefix")
+
+
 class ScheduleTests(unittest.TestCase):
-    def test_five_trajectories_45_prefixes_and_full_horizon_accounting(self):
-        plan = policy.plan()
-        self.assertEqual((len(plan["trajectories"]), len(plan["milestones"])), (5, 45))
-        self.assertEqual(plan["validation_generations_including_baseline"], 46 * 11332)
-        self.assertEqual(schedule.EVALUATION_POINTS,
-                         (10000, 20000, 40000, 80000, 160000, 320000, 640000, 1280000, 2560000))
+    def test_nominal_160k_lr_warmup_plateau_and_cooldown(self):
+        scope = schedule.campaign()
+        self.assertEqual((scope["lr_warmup_points"], scope["lr_cooldown_begin_points"],
+                          scope["lr_cooldown_end_points"]), (8000, 120000, 160000))
+        # lr_factor uses the update's midpoint, including the final short update.
+        for midpoint, expected in ((4000, .5), (8000, 1.), (80000, 1.),
+                                   (120000, 1.), (140000, .5), (159990, .00025)):
+            self.assertAlmostEqual(policy.lr_factor(midpoint - 10, 20, 160000), expected)
         for item in schedule.trajectories():
-            self.assertGreaterEqual(item["updates"], 40000)
+            first = policy.update_spec(item, 0)
+            factor = policy.lr_factor(0, first["points"], item["budget_points"])
+            self.assertAlmostEqual(factor, first["points"] / 2 / 8000)
+            last = policy.update_spec(item, item["updates"] - 1)
+            previous = schedule.accounting(item, item["updates"] - 1)["points"]
+            self.assertLess(policy.lr_factor(previous, last["points"], item["budget_points"]), .002)
+
+    def test_old_long_horizon_binding_is_rejected_before_in_place_writes(self):
+        original_design = {
+            "kind": "continuous-point-milestones-v1", "final_points": 2560000,
+            "evaluation_points": [10000, 20000, 40000, 80000, 160000, 320000, 640000, 1280000, 2560000],
+            "recovery_every_points": 5000, "recovery_retention": 2,
+            "boundary_policy": "complete_exact_mixture_groups_at_or_below_nominal_points",
+            "update_policy": "batch_32_except_short_update_at_recovery_boundary",
+            "lr_horizon": "full_trajectory_spendable_points",
+        }
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            atomic_json(root / "binding.json", {"training_design": original_design,
+                        "protocol": policy.PROTOCOL, "settings": policy.settings()})
+            atomic_json(root / "trajectories/on000/run.json", {"old_history": "preserve"})
+            before = tree_manifest(root)
+            for operation in ("bind", "run", "pilot", "estimate", "summary", "audit"):
+                with self.subTest(operation=operation), patch.object(sys, "argv", [
+                        "distill_grid.py", "--work-dir", str(root), operation]), \
+                        patch("sftlib.core.configure_local_storage",
+                              side_effect=AssertionError("No setup or cache writes")), \
+                        self.assertRaisesRegex(ValueError, "long-horizon checkpoints cannot be relabeled"):
+                    distill_grid.main()
+                self.assertEqual(tree_manifest(root), before)
+
+    def test_five_trajectories_25_prefixes_and_intended_160k_horizon(self):
+        plan = policy.plan()
+        self.assertEqual((len(plan["trajectories"]), len(plan["milestones"])), (5, 25))
+        self.assertEqual(plan["validation_generations_including_baseline"], 26 * 11332)
+        self.assertEqual(schedule.evaluation_points(), (10000, 20000, 40000, 80000, 160000))
+        self.assertEqual(plan["campaign"]["end_points"], 160000)
+        self.assertEqual(plan["campaign"]["lr_horizon_nominal_points"], 160000)
+        self.assertEqual(plan["totals"]["budget_points"], 800000)
+        self.assertEqual(plan["totals"]["points"], 799998)
+        self.assertEqual(plan["totals"]["updates"], 17792)
+        self.assertEqual(plan["totals"]["examples"], 566094)
+        self.assertEqual(schedule.EVALUATION_POINTS,
+                         (10000, 20000, 40000, 80000, 160000))
+        for item in schedule.trajectories():
+            self.assertEqual(item["budget_points"], 160000)
             self.assertEqual(item["points"], item["off_policy_examples"] + 2 * item["on_policy_examples"])
             self.assertEqual(schedule.accounting(item, item["updates"])["cursor"], item["examples"])
             previous_step, previous_groups = 0, 0
@@ -114,10 +180,16 @@ class ScheduleTests(unittest.TestCase):
                                  schedule.boundaries(item["on_policy_percent"])[nominal // 5000 - 1][2])
                 self.assertEqual(prefix["on_policy_examples"] * 100,
                                  prefix["examples"] * prefix["on_policy_percent"])
-        self.assertEqual(plan["totals"]["points"], sum(x["points"] for x in schedule.trajectories()))
+        self.assertEqual(plan["totals"]["points"],
+                         sum(schedule.milestone(p, 160000)["points"] for p in schedule.PERCENTAGES))
         self.assertGreater(sum(x["points"] for x in schedule.milestones()), plan["totals"]["points"])
         with self.assertRaises(ValueError):
             schedule.milestone(50, 5000)
+        self.assertEqual(len(policy.plan(80000)["milestones"]), 20)
+        self.assertEqual(policy.plan(80000)["training_design"], plan["training_design"])
+        for invalid in (False, 5000, 320000, 640000, 2560000):
+            with self.assertRaises(ValueError):
+                schedule.campaign(invalid)
 
     def test_new_bindings_select_design_and_old_bindings_are_rejected_untouched(self):
         with tempfile.TemporaryDirectory() as d:
@@ -126,6 +198,12 @@ class ScheduleTests(unittest.TestCase):
                     patch.object(inputs, "code_signature", return_value={"source": "provenance-only"}):
                 bound = inputs.binding(root, Path(d) / "pair", policy.settings(), create=True)
                 self.assertEqual(bound["training_design"], schedule.DESIGN)
+                # Smaller operational scopes never change this recipe's 160K LR horizon.
+                binding_hash = sha256(root / "binding.json")
+                for end_points in (40000, 80000, 160000):
+                    self.assertEqual(policy.plan(end_points)["training_design"], bound["training_design"])
+                    inputs.binding(root, Path(d) / "pair", policy.settings())
+                    self.assertEqual(sha256(root / "binding.json"), binding_hash)
                 original = read_json(root / "binding.json")
                 original.pop("training_design")
                 atomic_json(root / "binding.json", original)
@@ -208,6 +286,73 @@ class ScheduleTests(unittest.TestCase):
 
 
 class TrainingTests(unittest.TestCase):
+    def test_160k_endpoint_keeps_full_state_and_can_reload_permanent_snapshot(self):
+        with tempfile.TemporaryDirectory() as d:
+            root, other = Path(d) / "split", Path(d) / "uninterrupted"
+            item = schedule.trajectory(75)
+            with fake_training(root) as (bound, selected, calls, loads):
+                seed_checkpoint(root, bound, selected, 75, 155000)
+                binding_hash = sha256(root / "binding.json")
+                engine.train(root, bound, item, selected)
+                result = read_json(schedule.training_directory(root, item) / "training_summary.json")
+                self.assertEqual(result["points"], schedule.milestone(75, 160000)["points"])
+                self.assertEqual(result["status"], "complete")
+                checkpoint, record = milestones.verify(root, bound, schedule.milestone(75, 160000), selected)
+                state = pickle.loads((checkpoint / "training_state.pt").read_bytes())
+                self.assertTrue({"optimizer", "rng", "branch_rng", "accounting", "execution_config"} <= state.keys())
+                snapshot_hash = tree_manifest(checkpoint)
+                # Even if the rolling restarts are unavailable, the permanent endpoint is restartable.
+                shutil.rmtree(schedule.training_directory(root, item) / "checkpoints")
+                count = len(calls)
+                engine.train(root, bound, item, selected)
+                self.assertEqual(len(calls), count)
+                self.assertEqual(loads[-1], checkpoint)
+                self.assertEqual(tree_manifest(checkpoint), snapshot_hash)
+                self.assertEqual(sha256(root / "binding.json"), binding_hash)
+                split_calls = copy.deepcopy(calls)
+            with fake_training(other) as (bound, selected, calls, loads):
+                seed_checkpoint(other, bound, selected, 75, 155000)
+                engine.train(other, bound, item, selected)
+                self.assertEqual(calls, split_calls)
+
+    def test_worker_already_beyond_endpoint_does_not_load_gpu_or_rewrite_artifacts(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            with fake_training(root) as (bound, selected, calls, loads):
+                seed_checkpoint(root, bound, selected, 50, 85000)
+                before = tree_manifest(root)
+                engine.train(root, bound, schedule.trajectory(50), selected, until_points=80000)
+                self.assertEqual(tree_manifest(root), before)
+                self.assertFalse(calls)
+                self.assertFalse(loads)
+
+    def test_exact_endpoint_restart_repairs_snapshot_without_retraining(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            with fake_training(root) as (bound, selected, calls, loads):
+                original = seed_checkpoint(root, bound, selected, 50, 160000)
+                before = tree_manifest(original)
+                engine.train(root, bound, schedule.trajectory(50), selected)
+                snapshot, record = milestones.verify(root, bound, schedule.milestone(50, 160000), selected)
+                self.assertEqual(record["accounting"]["points"], 159999)
+                self.assertEqual(tree_manifest(snapshot), before)
+                self.assertFalse(calls)
+                self.assertEqual(loads, [original])
+                self.assertTrue(read_json(root / "trajectories/on050/training_summary.json")["target_reached"])
+
+    def test_already_advanced_checkpoint_still_requires_integrity(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            with fake_training(root) as (bound, selected, calls, loads):
+                checkpoint = seed_checkpoint(root, bound, selected, 0, 85000)
+                (checkpoint / "training_state.pt").write_bytes(b"corrupt")
+                before = tree_manifest(root)
+                with self.assertRaisesRegex(ValueError, "integrity failure"):
+                    controller.run_trajectories(root, bound, selected, None, SimpleNamespace(requested=False), 80000)
+                self.assertEqual(tree_manifest(root), before)
+                self.assertFalse(calls)
+                self.assertFalse(loads)
+
     def test_full_horizon_finishes_and_retains_final_checkpoint(self):
         with tempfile.TemporaryDirectory() as d:
             root = Path(d)
@@ -226,12 +371,12 @@ class TrainingTests(unittest.TestCase):
                     "step": step, "accounting": state, "optimizer": {"count": step},
                     "rng": random.Random(17).getstate(), "branch_rng": random.Random(19).getstate(),
                     "execution_config": value}, "synthetic test prefix")
-                engine.train(root, bound, item, selected, until_points=2560000)
+                engine.train(root, bound, item, selected)
                 result = read_json(owner / "training_summary.json")
                 self.assertEqual((result["status"], result["step"], result["points"]),
-                                 ("complete", 40448, 2560000))
+                                 ("complete", 2528, 160000))
                 self.assertEqual(len(calls), item["updates"] - step)
-                milestones.verify(root, bound, schedule.milestone(100, 2560000), selected)
+                milestones.verify(root, bound, schedule.milestone(100, 160000), selected)
 
     def test_restart_keeps_optimizer_rng_cursor_and_full_horizon_lr(self):
         with tempfile.TemporaryDirectory() as d:
@@ -256,11 +401,24 @@ class TrainingTests(unittest.TestCase):
                 self.assertTrue(all(path is not None for path in loads[1:]))
                 first = policy.update_spec(item, 0)
                 self.assertEqual(calls[0]["rate"], bound["settings"]["learning_rate"]
-                                 * policy.lr_factor(0, first["points"], item["points"]))
+                                 * policy.lr_factor(0, first["points"], item["budget_points"]))
             other = root / "uninterrupted"
             with fake_training(other) as (bound, selected, calls, loads):
                 engine.train(other, bound, item, selected, until_points=10000)
                 self.assertEqual(calls, split_calls)
+
+    def test_real_engine_uses_nominal_160k_lr_for_every_mixture(self):
+        for percent in schedule.PERCENTAGES:
+            with self.subTest(percent=percent), tempfile.TemporaryDirectory() as d:
+                root = Path(d)
+                item = schedule.trajectory(percent)
+                with fake_training(root) as (bound, selected, calls, loads):
+                    engine.train(root, bound, item, selected, session_updates=1, until_points=10000)
+                    spec = policy.update_spec(item, 0)
+                    self.assertEqual(calls[0]["rate"], bound["settings"]["learning_rate"]
+                                     * policy.lr_factor(0, spec["points"], 160000))
+                    self.assertNotEqual(calls[0]["rate"], bound["settings"]["learning_rate"]
+                                        * policy.lr_factor(0, spec["points"], 2560000))
 
     def test_publication_failure_is_repaired_from_real_restart_without_retraining(self):
         with tempfile.TemporaryDirectory() as d:
@@ -353,6 +511,14 @@ class OrchestrationTests(unittest.TestCase):
                     distill_grid.main()
                     self.assertEqual(train.call_args.args[2], schedule.trajectory(0))
                     self.assertEqual(train.call_args.kwargs["until_points"], 10000)
+                with patch.object(sys, "argv", [*prefix, "--end-points", "80000", "_train", "--cell", "on000"]), \
+                        patch.object(engine, "train") as train:
+                    distill_grid.main()
+                    self.assertEqual(train.call_args.kwargs["until_points"], 80000)
+                command = controller.command(root, root / "pair", Path("settings.json"), "_train",
+                                             "--cell", "on000", end_points=80000)
+                self.assertEqual(command[command.index("--end-points") + 1], "80000")
+                self.assertLess(command.index("--end-points"), command.index("_train"))
                 item = schedule.milestone(0, 10000)
                 output = schedule.evaluation_directory(root, item) / "evaluation"
                 with patch.object(sys, "argv", [*prefix, "_evaluate", "--cell", item["id"],
@@ -367,7 +533,7 @@ class OrchestrationTests(unittest.TestCase):
             root = Path(d)
             done, evaluated, trained = set(), set(), []
             def train(root, item, selected, runner, until_points=None):
-                self.assertEqual(item["budget_points"], 2560000)
+                self.assertEqual(item["budget_points"], 160000)
                 trained.append((item["id"], until_points))
                 done.add(schedule.milestone(item["on_policy_percent"], until_points)["id"])
                 return True
@@ -375,7 +541,8 @@ class OrchestrationTests(unittest.TestCase):
                 self.assertIn(item["id"], done)
                 evaluated.add(item["id"])
                 return True
-            summary = {"complete_cells": 45, "complete_trajectories": 5}
+            summary = {"complete_cells": 25, "complete_trajectories": 5,
+                       "campaign_complete": True, "skipped_trajectories": []}
             with patch.object(controller, "check_completed_training", side_effect=lambda r,b,i,s: i["id"] in done), \
                     patch.object(controller, "train_with_recovery", train), \
                     patch.object(controller, "ensure_evaluation", evaluate), \
@@ -383,12 +550,12 @@ class OrchestrationTests(unittest.TestCase):
                     contextlib.redirect_stdout(io.StringIO()):
                 controller.run_trajectories(root, {"training_design":schedule.DESIGN}, {}, None,
                                             SimpleNamespace(requested=False))
-                self.assertEqual(len(trained), 45)
+                self.assertEqual(len(trained), 25)
                 self.assertEqual(len({x[0] for x in trained}), 5)
-                self.assertEqual(evaluated, {x["id"] for x in schedule.milestones()})
+                self.assertEqual(evaluated, {x["id"] for x in schedule.active_milestones()})
                 controller.run_trajectories(root, {"training_design":schedule.DESIGN}, {}, None,
                                             SimpleNamespace(requested=False))
-                self.assertEqual(len(trained), 45)
+                self.assertEqual(len(trained), 25)
                 self.assertEqual(read_json(root / "status.json")["status"], "complete")
 
     def test_oom_retry_keeps_milestone_target_and_uses_trajectory_restart(self):
@@ -409,6 +576,75 @@ class OrchestrationTests(unittest.TestCase):
             self.assertTrue(all(args[-2:] == ("--until-points", 40000) for args in calls))
             self.assertEqual(lower.call_args.kwargs["checkpoint"], "real-restart")
 
+    def test_in_place_controller_skips_advanced_mixture_and_missing_past_but_reuses_snapshots(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            done = {schedule.milestone(25, 20000)["id"]}
+            trained, evaluated = [], []
+            def restart(root, bound, trajectory, selected):
+                percent = trajectory["on_policy_percent"]
+                if percent == 0:
+                    return Path("later"), {"step": schedule.milestone(0, 160000)["updates"]}
+                if percent == 25:
+                    return Path("partial"), {"step": schedule.boundaries(25)[4][2]}  # 25K
+                return None, None
+            def train(root, item, selected, runner, until_points=None):
+                trained.append((item["on_policy_percent"], until_points))
+                done.add(schedule.milestone(item["on_policy_percent"], until_points)["id"])
+                return True
+            def evaluate(root, bound, item, selected, runner):
+                self.assertIn(item["id"], done)
+                evaluated.append(item["id"])
+                return True
+            summary = {"complete_cells": 15, "complete_trajectories": 3,
+                       "campaign_complete": True, "skipped_trajectories": ["on000"]}
+            with patch.object(milestones, "latest_restart", side_effect=restart), \
+                    patch.object(controller, "check_completed_training", side_effect=lambda r,b,i,s: i["id"] in done), \
+                    patch.object(controller, "train_with_recovery", side_effect=train), \
+                    patch.object(controller, "ensure_evaluation", side_effect=evaluate), \
+                    patch.object(reporting, "summary", return_value=summary), \
+                    contextlib.redirect_stdout(io.StringIO()):
+                controller.run_trajectories(root, {"training_design": schedule.DESIGN}, {}, None,
+                                            SimpleNamespace(requested=False), 80000)
+            self.assertEqual(len(trained), 14)
+            self.assertEqual(len(evaluated), 15)
+            self.assertFalse(any(percent == 0 or (percent == 25 and point <= 25000) for percent, point in trained))
+            self.assertIn(schedule.milestone(25, 20000)["id"], evaluated)
+            self.assertNotIn(schedule.milestone(25, 10000)["id"], evaluated)
+            self.assertTrue(all(point <= 80000 for _, point in trained))
+            status = read_json(root / "status.json")
+            self.assertEqual(status["status"], "complete")
+            self.assertEqual(status["skipped_trajectories"], ["on000"])
+
+    def test_exceeded_mixtures_finish_without_fake_evaluations_and_audit_reports_skips(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            with fake_training(root) as (bound, selected, calls, loads):
+                for percent in schedule.PERCENTAGES:
+                    seed_checkpoint(root, bound, selected, percent, 85000)
+                protected = tree_manifest(root)
+                with patch.object(controller, "train_with_recovery", side_effect=AssertionError("No retraining")), \
+                        patch.object(controller, "ensure_evaluation", side_effect=AssertionError("No evaluation backlog")):
+                    controller.run_trajectories(root, bound, selected, None, SimpleNamespace(requested=False), 80000)
+                result = read_json(root / "summary.json")
+                self.assertTrue(result["campaign_complete"])
+                self.assertEqual(result["complete_cells"], 0)
+                self.assertEqual(result["complete_trajectories"], 0)
+                self.assertEqual(len(result["skipped_trajectories"]), 5)
+                self.assertEqual(len(result["skipped_milestones"]), 20)
+                self.assertTrue(all(row["rouge2"] is None for row in result["rows"]))
+                self.assertEqual(read_json(root / "status.json")["status"], "complete")
+                atomic_json(root / "baseline/latest_evaluation.json", {"path": str(root / "baseline/evaluation")})
+                with patch("gridlib.audit.saved_pilot", return_value=selected), \
+                        patch.object(evaluation, "identity", return_value={}), \
+                        patch.object(evaluation, "verify"), patch.object(audit, "prediction_audit", return_value={}):
+                    report = audit.audit(root, bound, 80000)
+                self.assertEqual(report["status"], "pass_with_skips")
+                self.assertFalse(report["cells"])
+                self.assertEqual(len(report["skipped"]), 20)
+                after = tree_manifest(root)
+                self.assertTrue(all(after[name] == info for name, info in protected.items()))
+
     def test_summary_and_estimate_do_not_sum_prefix_training_as_independent_runs(self):
         with tempfile.TemporaryDirectory() as d:
             root = Path(d)
@@ -416,7 +652,7 @@ class OrchestrationTests(unittest.TestCase):
                 item = schedule.trajectory(0)
                 engine.train(root, bound, item, selected, until_points=20000)
                 result = reporting.summary(root)
-                self.assertEqual(len(result["rows"]), 45)
+                self.assertEqual(len(result["rows"]), 25)
                 self.assertEqual(result["rows"][0]["status"], "trained")
                 self.assertEqual(result["rows"][1]["status"], "trained")
                 actual = read_json(schedule.training_directory(root, item) / "training_summary.json")
@@ -432,8 +668,15 @@ class OrchestrationTests(unittest.TestCase):
                     "n":11332, "status":"complete", "evaluation_seconds":2., "wall_seconds":3.}):
                 estimate = reporting.estimate(root, selected, policy.settings())
             self.assertEqual(len(estimate["trajectories"]), 5)
-            self.assertEqual(sum(x["evaluations"] for x in estimate["trajectories"]), 45)
+            self.assertEqual(sum(x["evaluations"] for x in estimate["trajectories"]), 25)
             self.assertEqual(sum(x["points"] for x in estimate["trajectories"]), policy.plan()["totals"]["points"])
+            self.assertTrue(all(row["recovery_saves_including_initial"] == 33 for row in estimate["trajectories"]))
+            self.assertEqual(estimate["campaign"]["end_points"], 160000)
+            with patch.object(evaluation, "verify", return_value={
+                    "n":11332, "status":"complete", "evaluation_seconds":2., "wall_seconds":3.}):
+                shorter = reporting.estimate(root, selected, policy.settings(), 80000)
+            self.assertEqual(sum(x["evaluations"] for x in shorter["trajectories"]), 20)
+            self.assertEqual(shorter["campaign"]["lr_horizon_nominal_points"], 160000)
 
 
 if __name__ == "__main__":

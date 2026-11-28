@@ -6,7 +6,7 @@ import json
 import os
 from pathlib import Path
 
-from gridlib import policy
+from gridlib import policy, schedule
 from gridlib.shared import RunLock, atomic_json, read_json
 from sftlib.console import output as display
 
@@ -17,6 +17,9 @@ def main():
     parser.add_argument("--sft-work", type=Path, default=Path(os.environ.get("SFT_WORK", "../runpod-sft/work")))
     parser.add_argument("--settings", type=Path, default=policy.ROOT / "settings.json")
     parser.add_argument("--json", action="store_true", help="JSON for plan/summary/estimate/audit reports")
+    parser.add_argument("--end-points", type=int, choices=schedule.EVALUATION_POINTS,
+                        default=schedule.DEFAULT_END_POINTS,
+                        help="Active endpoint up to 160000; the intended LR horizon remains 160K")
     commands = parser.add_subparsers(dest="command")
     commands.add_parser("plan", help="Read-only grid/count/runtime scenarios; no ML imports")
     commands.add_parser("bind", help="Verify/freeze completed SFT or approved external pair (hashes; no GPU/model load)")
@@ -39,17 +42,16 @@ def main():
     operation = args.command or "plan"
     settings = policy.settings(args.settings)
     if operation == "plan":
-        display({**policy.plan(), "settings": settings}, "Point-budget GKD plan", args.json)
+        display({**policy.plan(args.end_points), "settings": settings}, "Point-budget GKD plan", args.json)
         return
     root, sft_work = args.work_dir.resolve(), args.sft_work.resolve()
-    from gridlib import schedule
     schedule.validate_root(root, allow_new=operation == "bind")
     if operation == "summary":
         from gridlib.reporting import summary
         if not root.is_dir():
             raise ValueError("No existing grid work directory")
         with RunLock(root / ".controller.lock"):
-            display(summary(root), "Grid results", args.json)
+            display(summary(root, args.end_points), "Grid results", args.json)
         return
     from gridlib.inputs import binding, separate_work
     separate_work(root, sft_work)
@@ -58,7 +60,7 @@ def main():
         from gridlib.reporting import estimate
         # Read only: no locks/directories/files are created and no CUDA is touched.
         bound = binding(root, sft_work, settings, full=False)
-        display(estimate(root, saved_pilot(root), settings), "Grid runtime estimate", args.json)
+        display(estimate(root, saved_pilot(root), settings, args.end_points), "Grid runtime estimate", args.json)
         return
     lock_name = ".worker.lock" if operation.startswith("_") else ".controller.lock"
     if operation in ("pilot", "run", "_runtime", "_pilot", "_evaluation_pilot", "_train", "_evaluate"):
@@ -70,17 +72,18 @@ def main():
             print("Verified validated external pair; no model loaded or GPU used."
                   if bound["inputs"].get("kind") == "validated-external-pair-v1"
                   else "Verified completed 100K/8K SFT pair; no model loaded or GPU used.")
-            print("Continuous design: five mixtures, 2,560,000 nominal points each; "
-                  "45 retained/evaluated milestones, rolling recovery every 5,000 points.")
+            print(f"Continuous design: five mixtures through {args.end_points:,} nominal points each; "
+                  f"{len(schedule.active_milestones(args.end_points))} retained/evaluated milestones. "
+                  "160K LR horizon: 8K warmup, 120K–160K cooldown; rolling recovery every 5,000 points.")
         elif operation == "audit":
             from gridlib.audit import audit
-            result = audit(root, bound)
+            result = audit(root, bound, args.end_points)
             atomic_json(root / "audit.json", result)
             display(result, "Grid integrity audit", args.json)
         elif operation == "pilot":
             from gridlib.controller import pilot
             try:
-                pilot(root, bound, args.settings.resolve())
+                pilot(root, bound, args.settings.resolve(), args.end_points)
             except BaseException as error:
                 atomic_json(root / "status.json", {"status": "pilot_failed", "error": str(error)})
                 raise
@@ -89,7 +92,7 @@ def main():
             # Verify immutable backing bytes again before a long grid/resume.
             binding(root, sft_work, settings, full=True)
             try:
-                run(root, bound, args.settings.resolve())
+                run(root, bound, args.settings.resolve(), args.end_points)
             except BaseException as error:
                 atomic_json(root / "status.json", {"status": "failed", "error": str(error)})
                 raise
@@ -132,7 +135,7 @@ def main():
                     if args.session_updates is not None and args.session_updates < 1:
                         raise ValueError("Session pilot update cap must be positive")
                     train(root, bound, item, selected, args.session_updates, microbatch=actual_batch,
-                          until_points=args.until_points)
+                          until_points=args.until_points if args.until_points is not None else args.end_points)
                 else:
                     from gridlib.evaluation import evaluate
                     if args.output is None:

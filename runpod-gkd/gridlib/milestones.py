@@ -10,20 +10,64 @@ from .shared import (atomic_json, checkpoints, check_space, read_json, sha256,
                      sync_directory, sync_tree)
 
 
+def verify_run(root, bound, trajectory, selected):
+    from .controller import training_config
+    schedule.require_design(bound)
+    schedule.require_trajectory(trajectory)
+    run = read_json(schedule.training_directory(root, trajectory) / "run.json")
+    signatures = {"binding_sha256": sha256(root / "binding.json"),
+                  "pilot_sha256": sha256(root / "pilot.json")}
+    if (run["config"] != training_config(bound, trajectory, selected)
+            or run["signatures"] != signatures
+            or run["initial_student"] != bound["inputs"]["paths"]["student_checkpoint"]):
+        raise ValueError("Trajectory provenance/configuration changed")
+    return run
+
+
+def latest_restart(root, bound, trajectory, selected, *, full=True):
+    """Read-only latest full-state restart; permanent copies survive rolling loss."""
+    run_dir = schedule.training_directory(root, trajectory)
+    if not (run_dir / "run.json").exists():
+        if run_dir.exists():
+            raise ValueError(f"Unowned trajectory directory: {run_dir}")
+        return None, None
+    run = verify_run(root, bound, trajectory, selected)
+    candidates = [(read_json(path / "COMPLETE.json")["step"], path, None)
+                  for path in checkpoints.completed(run_dir)]
+    for item in schedule.milestones():
+        owner = schedule.evaluation_directory(root, item)
+        if item["trajectory_id"] == trajectory["id"] and (owner / "snapshot.json").exists():
+            candidates.append((item["updates"], owner / "checkpoint", item))
+    if not candidates:
+        if not full:
+            return None, None  # A first save can fail; reporting must still show pending work.
+        raise ValueError("Initialized trajectory has no complete full-state restart")
+    step, checkpoint, item = max(candidates, key=lambda row: row[0])
+    if type(step) is not int or not 0 <= step <= trajectory["updates"]:
+        raise ValueError("Invalid saved trajectory update count")
+    if full and item is not None:
+        checkpoint, _ = verify(root, bound, item, selected)
+        marker = read_json(checkpoint / "COMPLETE.json")  # Already fully verified above.
+    else:
+        marker = (checkpoints.verify(checkpoint, run["run_id"]) if full
+                  else read_json(checkpoint / "COMPLETE.json"))
+    metadata = read_json(checkpoint / "metadata.json")
+    if (marker["step"] != step or marker["run_id"] != run["run_id"]
+            or metadata["step"] != step or metadata["run_id"] != run["run_id"]
+            or metadata["config"] != run["config"] or metadata["signatures"] != run["signatures"]
+            or "training_state.pt" not in marker["files"]):
+        raise ValueError("Restart checkpoint recipe/provenance differs")
+    return checkpoint, marker
+
+
 def verify(root, bound, item, selected):
     schedule.require_design(bound)
     schedule.require_milestone(item)
     from .engine import check_state
-    from .controller import training_config
-    run_dir = root / "trajectories" / item["trajectory_id"]
-    run = read_json(run_dir / "run.json")
+    trajectory = schedule.trajectory(item["on_policy_percent"])
+    run = verify_run(root, bound, trajectory, selected)
     signatures = {"binding_sha256": sha256(root / "binding.json"),
                   "pilot_sha256": sha256(root / "pilot.json")}
-    trajectory = schedule.trajectory(item["on_policy_percent"])
-    if (run["config"] != training_config(bound, trajectory, selected)
-            or run["signatures"] != signatures
-            or run["initial_student"] != bound["inputs"]["paths"]["student_checkpoint"]):
-        raise ValueError("Milestone trajectory provenance/configuration changed")
     owner = schedule.evaluation_directory(root, item)
     record = read_json(owner / "snapshot.json")
     checkpoint = owner / "checkpoint"

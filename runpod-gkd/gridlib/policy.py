@@ -87,6 +87,6 @@ def code_signature():
     return {p.relative_to(ROOT.parent).as_posix(): sha256(p) for p in paths}
 
 
-def plan():
+def plan(end_points=None):
     from .schedule import plan as continuous_plan
-    return continuous_plan()
+    return continuous_plan(**({} if end_points is None else {"end_points": end_points}))

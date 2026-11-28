@@ -17,14 +17,16 @@ from . import schedule
 from sftlib.console import message, output as display, run_logged
 
 
-def command(root, sft_work, settings_path, operation, *extra):
+def command(root, sft_work, settings_path, operation, *extra, end_points=schedule.DEFAULT_END_POINTS):
     return [sys.executable, "-u", str(ROOT / "distill_grid.py"), "--work-dir", str(root),
-            "--sft-work", str(sft_work), "--settings", str(settings_path), operation, *map(str, extra)]
+            "--sft-work", str(sft_work), "--settings", str(settings_path),
+            "--end-points", str(end_points), operation, *map(str, extra)]
 
 
 class Runner:
-    def __init__(self, root, sft_work, settings_path, stop):
+    def __init__(self, root, sft_work, settings_path, stop, end_points=schedule.DEFAULT_END_POINTS):
         self.root, self.sft_work, self.settings_path, self.stop = root, sft_work, settings_path, stop
+        self.end_points = end_points
 
     def call(self, operation, cell_id, *extra):
         if self.stop.requested:
@@ -46,7 +48,8 @@ class Runner:
             if operation in ("train", "evaluate"):
                 worker_extra += ["--attempt-result", str(attempt)]
             code = run_logged(
-                command(self.root, self.sft_work, self.settings_path, "_" + operation, *worker_extra),
+                command(self.root, self.sft_work, self.settings_path, "_" + operation, *worker_extra,
+                        end_points=self.end_points),
                 log, self.stop, cwd=ROOT,
                 env={"PYTHONUNBUFFERED": "1", "TOKENIZERS_PARALLELISM": "false"})
             if code and not self.stop.requested:
@@ -64,7 +67,7 @@ class Runner:
                    {"cell": cell_id, "operation": operation, "seconds": time.monotonic() - started,
                     "return_code": code, "log": str(log), **stage_context})
             if cell_id != "shared":
-                reporting.summary(self.root)
+                reporting.summary(self.root, self.end_points)
 
 
 def saved_pilot(root):
@@ -134,11 +137,11 @@ def check_completed_training(root, bound, item, selected):
     return True
 
 
-def pilot(root, bound, settings_path):
+def pilot(root, bound, settings_path, end_points=schedule.DEFAULT_END_POINTS):
     schedule.require_design(bound)
     from sftlib.sequence import ChildStop
     with ChildStop() as stop:
-        runner = Runner(root, bound["inputs"]["sft_work"], settings_path, stop)
+        runner = Runner(root, bound["inputs"]["sft_work"], settings_path, stop, end_points)
         if not runner.call("runtime", "shared"):
             return
         runtime = read_json(root / "runtime.json")
@@ -176,7 +179,7 @@ def pilot(root, bound, settings_path):
             return
         if not ensure_evaluation(root, bound, None, selected, runner):
             return
-        forecast = reporting.estimate(root, selected, bound["settings"])
+        forecast = reporting.estimate(root, selected, bound["settings"], end_points)
         atomic_json(root / "estimate.json", forecast)
         atomic_json(root / "status.json", {"status": "pilot_ready",
                                           "microbatch": selected["microbatch"],
@@ -184,16 +187,16 @@ def pilot(root, bound, settings_path):
         display(forecast, "Grid runtime estimate")
 
 
-def run(root, bound, settings_path):
+def run(root, bound, settings_path, end_points=schedule.DEFAULT_END_POINTS):
     schedule.require_design(bound)
     from sftlib.sequence import ChildStop
     selected = saved_pilot(root)
     # Full measured forecast is printed before ANY grid cell is started.
-    forecast = reporting.estimate(root, selected, bound["settings"])
+    forecast = reporting.estimate(root, selected, bound["settings"], end_points)
     atomic_json(root / "estimate.json", forecast)
     display(forecast, "Grid runtime estimate")
     with ChildStop() as stop:
-        runner = Runner(root, bound["inputs"]["sft_work"], settings_path, stop)
+        runner = Runner(root, bound["inputs"]["sft_work"], settings_path, stop, end_points)
         if not runner.call("runtime", "shared"):
             return
         if read_json(root / "runtime.json") != selected["runtime"]:
@@ -202,33 +205,48 @@ def run(root, bound, settings_path):
             return
         if not ensure_evaluation(root, bound, None, selected, runner):
             return
-        return run_trajectories(root, bound, selected, runner, stop)
+        return run_trajectories(root, bound, selected, runner, stop, end_points)
 
 
-def run_trajectories(root, bound, selected, runner, stop):
+def run_trajectories(root, bound, selected, runner, stop, end_points=schedule.DEFAULT_END_POINTS):
     """Resume each mixture's single full-state trajectory between evaluated prefixes."""
     schedule.require_design(bound)
+    scope = schedule.campaign(end_points)
+    from .milestones import latest_restart
     for trajectory in schedule.trajectories():
-        for nominal in schedule.EVALUATION_POINTS:
+        if stop.requested:
+            break
+        _, marker = latest_restart(root, bound, trajectory, selected)
+        step = marker["step"] if marker else 0
+        target = schedule.milestone(trajectory["on_policy_percent"], end_points)
+        if step > target["updates"]:
+            message(f"{trajectory['id']} already beyond {end_points:,} nominal points; moving to next mixture.")
+            continue
+        for nominal in schedule.evaluation_points(end_points):
             if stop.requested:
                 break
             item = schedule.milestone(trajectory["on_policy_percent"], nominal)
             message(f"Trajectory {trajectory['id']} · milestone {nominal:,} nominal points "
                     f"({item['points']:,} actual; update {item['updates']:,})")
             if not check_completed_training(root, bound, item, selected):
+                if step > item["updates"]:
+                    message(f"{item['id']} has no retained snapshot and is behind the current checkpoint; skipping.")
+                    continue
                 if not train_with_recovery(root, trajectory, selected, runner, until_points=nominal):
                     break
                 if not check_completed_training(root, bound, item, selected):
                     break
+                step = item["updates"]
             if not ensure_evaluation(root, bound, item, selected, runner):
                 break
-            reporting.summary(root)
+            reporting.summary(root, end_points)
         else:
             continue
         break
-    result = reporting.summary(root)
+    result = reporting.summary(root, end_points)
     atomic_json(root / "status.json", {
-        "status": "complete" if result["complete_cells"] == len(schedule.milestones()) else "paused",
+        "status": "complete" if result["campaign_complete"] else "paused",
+        "campaign": scope, "skipped_trajectories": result["skipped_trajectories"],
         "training_design": schedule.DESIGN, "complete_cells": result["complete_cells"],
         "complete_milestones": result["complete_cells"],
         "complete_trajectories": result["complete_trajectories"],

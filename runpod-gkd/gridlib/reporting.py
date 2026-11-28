@@ -7,6 +7,7 @@ import math
 from pathlib import Path
 
 from .shared import atomic_json, read_json
+from . import schedule
 
 
 def select_pilot(results, candidates):
@@ -31,9 +32,9 @@ def select_pilot(results, candidates):
             "on_policy": next(x for x in branches if x["online"])}
 
 
-def estimate(root, selected, settings):
+def estimate(root, selected, settings, end_points=schedule.DEFAULT_END_POINTS):
     from .trajectory_reporting import estimate as trajectory_estimate
-    return trajectory_estimate(root, selected, settings)
+    return trajectory_estimate(root, selected, settings, end_points)
 
 
 def records(path):
@@ -51,9 +52,22 @@ def records(path):
     return result
 
 
-def summary(root):
-    from . import schedule
-    schedule.validate_root(root)
+def summary(root, end_points=schedule.DEFAULT_END_POINTS):
+    bound = schedule.validate_root(root)
+    scope = schedule.campaign(end_points)
+    from .milestones import latest_restart
+    progress, skipped_trajectories = {}, []
+    for trajectory in schedule.trajectories():
+        run_path = schedule.training_directory(root, trajectory) / "run.json"
+        if not run_path.exists():
+            progress[trajectory["id"]] = 0
+            continue
+        # Display only. Controller/audit fully verify bytes before reusing/skipping.
+        _, marker = latest_restart(root, bound, trajectory,
+                                   {"microbatch": read_json(run_path)["config"]["microbatch"]}, full=False)
+        progress[trajectory["id"]] = marker["step"] if marker else 0
+        if progress[trajectory["id"]] > schedule.milestone(trajectory["on_policy_percent"], end_points)["updates"]:
+            skipped_trajectories.append(trajectory["id"])
     stages = records(root / "stages.jsonl")
     baseline_metrics = {}
     baseline_pointer = root / "baseline/latest_evaluation.json"
@@ -64,7 +78,7 @@ def summary(root):
                 "evaluation_seconds": baseline_metrics.get("evaluation_seconds"),
                 "scores": baseline_metrics.get("scores", {})}
     rows = []
-    for item in schedule.milestones():
+    for item in schedule.active_milestones(end_points):
         run_dir = schedule.evaluation_directory(root, item)
         training_owner = root / "trajectories" / item["trajectory_id"]
         training_path = run_dir / "snapshot.json"
@@ -89,6 +103,8 @@ def summary(root):
         status = training.get("status", "pending")
         if status == "complete":
             status = "complete" if evaluation.get("status") == "complete" else "trained"
+        elif progress[item["trajectory_id"]] > item["updates"]:
+            status = "skipped_past_checkpoint"
         r2 = evaluation.get("scores", {}).get("rouge2")
         baseline_r2 = baseline["scores"].get("rouge2")
         row = {"cell": item["id"], "on_policy_percent": item["on_policy_percent"],
@@ -134,6 +150,17 @@ def summary(root):
                                   "is a component of shared_stage_wall_seconds, not an additional cost. "
                                   "Killed controllers may leave unmeasured stages."}
     result["training_design"] = schedule.DESIGN
+    result["campaign"] = scope
+    result["skipped_trajectories"] = skipped_trajectories
+    result["skipped_milestones"] = [
+        row["cell"] for row in rows if row["status"] == "skipped_past_checkpoint" or (
+            row["status"] != "complete" and f"on{row['on_policy_percent']:03d}" in skipped_trajectories)]
+    result["finished_trajectories"] = sum(
+        f"on{percent:03d}" in skipped_trajectories or all(
+            row["status"] in ("complete", "skipped_past_checkpoint")
+            for row in rows if row["on_policy_percent"] == percent)
+        for percent in schedule.PERCENTAGES)
+    result["campaign_complete"] = result["finished_trajectories"] == len(schedule.PERCENTAGES)
     result["complete_milestones"] = result["complete_cells"]
     result["complete_trajectories"] = sum(
         all(row["status"] == "complete" for row in rows if row["on_policy_percent"] == percent)
@@ -157,6 +184,9 @@ def summary(root):
     def show(value, divisor=1):
         return "—" if value is None else f"{value / divisor:.3f}"
     lines = ["# Point-budget GKD results", "",
+             f"Active endpoint: {end_points:,} nominal points; immutable LR horizon: {schedule.FINAL_POINTS:,}. "
+             f"Mixtures skipped because already beyond endpoint: {', '.join(skipped_trajectories) or 'none'}.",
+             "Skipped checkpoints are not counted as completed evaluations.", "",
              f"Common SFT baseline R2: **{show(baseline['scores'].get('rouge2'))}**; "
              f"validation minutes: {show(baseline['evaluation_seconds'], 60)}. "
              "Prior SFT training is not charged to GKD.", "",

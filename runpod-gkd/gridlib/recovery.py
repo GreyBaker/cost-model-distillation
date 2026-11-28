@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import time
 
-from .shared import atomic_json, checkpoints, read_json, sha256
+from .shared import atomic_json, read_json, sha256
 
 OOM_EXIT_CODE = 86
 
@@ -68,11 +68,9 @@ def lower(root, path, initial, failed, *, training=False, **context):
 
 
 def checkpoint_for_retry(root, item):
-    from .schedule import training_directory
-    run_dir = training_directory(root, item)
-    checkpoint = checkpoints.resolve(run_dir)
-    marker = checkpoints.verify(checkpoint, read_json(run_dir / "run.json")["run_id"])
-    return checkpoint, marker
+    from .milestones import latest_restart
+    return latest_restart(root, read_json(root / "binding.json"), item,
+                          read_json(root / "pilot.json")["selected"])
 
 
 def train_with_recovery(root, item, selected, runner, until_points=None):
