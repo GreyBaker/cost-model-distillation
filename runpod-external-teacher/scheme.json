@@ -69,7 +69,7 @@
     "report_empty_and_generation_cap_rates": true,
     "report_paired_bootstrap_difference": true,
     "quality_gate_status": "informational_only_no_quality_admission_gates",
-    "operator_approval_before_binding": true,
+    "operator_approval_before_binding": false,
     "quality_failure_override": "not required; legacy command flags are no-ops and published records remain archival provenance",
     "publisher_scores_are_independently_verified": false,
     "test_split_used_for_decisions": false,
@@ -107,7 +107,8 @@
     "training_fit_pilot": "existing joint student/teacher hardware pilot; no SFT pilot",
     "evaluation_batch_pilot": "once-only student-only fit and warmed-throughput calibration with tested safety ceiling; historical pilots reused unchanged",
     "baseline": "existing full common baseline in the new runtime",
-    "estimate_approval_required": true,
+    "estimate_approval_required": false,
+    "execution": "one explicit run command; automatic import, validation, calibration, training and audit",
     "reuse_old_grid_binding_or_pilots": false,
     "source_code_fingerprints": "record and warn only; never block resume or force recalibration"
   },

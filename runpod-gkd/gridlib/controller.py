@@ -137,75 +137,76 @@ def check_completed_training(root, bound, item, selected):
     return True
 
 
-def pilot(root, bound, settings_path, end_points=schedule.DEFAULT_END_POINTS):
+def calibrate(root, bound, runner):
+    """Automatic once-only fit/batching discovery; cached pilot files keep their identities."""
     schedule.require_design(bound)
-    from sftlib.sequence import ChildStop
-    with ChildStop() as stop:
-        runner = Runner(root, bound["inputs"]["sft_work"], settings_path, stop, end_points)
-        if not runner.call("runtime", "shared"):
-            return
-        runtime = read_json(root / "runtime.json")
-        request = {"binding_sha256": sha256(root / "binding.json"), "runtime": runtime}
-        request_path = root / "pilot_request.json"
-        if request_path.exists() and read_json(request_path) != request:
-            raise ValueError("Pilot hardware/software/inputs changed; use a new grid directory")
-        atomic_json(request_path, request)
-        if (root / "pilot.json").exists():
-            selected = saved_pilot(root)
-            if selected["runtime"] != runtime:
-                raise ValueError("Saved pilot is not applicable to the current GPU/software")
-            print(f"Reusing once-only pilot: microbatch {selected['microbatch']}", flush=True)
-        else:
-            results, files = [], []
-            for size in bound["settings"]["pilot_microbatches"]:
-                for online in (False, True):
-                    output = root / "pilots" / f"mb{size:02d}_{'on' if online else 'off'}.json"
-                    if not output.exists():
-                        if not runner.call("pilot", "shared", "--microbatch", size, "--online", int(online),
-                                           "--output", output):
-                            return
-                    result = read_json(output)
-                    if (result["microbatch"] != size or result["online"] != online
-                            or result["binding_sha256"] != request["binding_sha256"]
-                            or (result.get("runtime") is not None and result["runtime"] != runtime)
-                            or result["status"] not in ("pass", "oom", "headroom")):
-                        raise ValueError("Invalid or foreign pilot result")
-                    results.append(result)
-                    files.append({"path": str(output), "sha256": sha256(output)})
-            selected = reporting.select_pilot(results, bound["settings"]["pilot_microbatches"])
-            atomic_json(root / "pilot.json", {"binding_sha256": request["binding_sha256"],
-                        "selected": selected, "result_files": files})
-        if not evalpilot.ensure(root, bound, selected, runner):
-            return
-        if not ensure_evaluation(root, bound, None, selected, runner):
-            return
-        forecast = reporting.estimate(root, selected, bound["settings"], end_points)
-        atomic_json(root / "estimate.json", forecast)
-        atomic_json(root / "status.json", {"status": "pilot_ready",
-                                          "microbatch": selected["microbatch"],
-                                          "evaluation_batch_size": evaluation_initial(root, bound, selected)})
-        display(forecast, "Grid runtime estimate")
+    if not runner.call("runtime", "shared"):
+        return None
+    runtime = read_json(root / "runtime.json")
+    request = {"binding_sha256": sha256(root / "binding.json"), "runtime": runtime}
+    request_path = root / "pilot_request.json"
+    if request_path.exists() and read_json(request_path) != request:
+        raise ValueError("Calibration hardware/software/inputs changed; use a new grid directory")
+    atomic_json(request_path, request)
+    if (root / "pilot.json").exists():
+        selected = saved_pilot(root)
+        if selected["runtime"] != runtime:
+            raise ValueError("Saved calibration is not applicable to the current GPU/software")
+        message(f"Reusing fit calibration: microbatch {selected['microbatch']}")
+    else:
+        results, files = [], []
+        for size in bound["settings"]["pilot_microbatches"]:
+            for online in (False, True):
+                output = root / "pilots" / f"mb{size:02d}_{'on' if online else 'off'}.json"
+                if not output.exists():
+                    if not runner.call("pilot", "shared", "--microbatch", size, "--online", int(online),
+                                       "--output", output):
+                        return None
+                result = read_json(output)
+                if (result["microbatch"] != size or result["online"] != online
+                        or result["binding_sha256"] != request["binding_sha256"]
+                        or (result.get("runtime") is not None and result["runtime"] != runtime)
+                        or result["status"] not in ("pass", "oom", "headroom")):
+                    raise ValueError("Invalid or foreign calibration result")
+                results.append(result)
+                files.append({"path": str(output), "sha256": sha256(output)})
+        selected = reporting.select_pilot(results, bound["settings"]["pilot_microbatches"])
+        atomic_json(root / "pilot.json", {"binding_sha256": request["binding_sha256"],
+                    "selected": selected, "result_files": files})
+    if not evalpilot.ensure(root, bound, selected, runner):
+        return None
+    if not ensure_evaluation(root, bound, None, selected, runner):
+        return None
+    return selected
 
 
 def run(root, bound, settings_path, end_points=schedule.DEFAULT_END_POINTS):
     schedule.require_design(bound)
     from sftlib.sequence import ChildStop
-    selected = saved_pilot(root)
-    # Full measured forecast is printed before ANY grid cell is started.
-    forecast = reporting.estimate(root, selected, bound["settings"], end_points)
-    atomic_json(root / "estimate.json", forecast)
-    display(forecast, "Grid runtime estimate")
     with ChildStop() as stop:
         runner = Runner(root, bound["inputs"]["sft_work"], settings_path, stop, end_points)
-        if not runner.call("runtime", "shared"):
+        selected = calibrate(root, bound, runner)
+        if selected is None or stop.requested:
+            atomic_json(root / "status.json", {"status": "paused", "operation": "automatic calibration"})
             return
-        if read_json(root / "runtime.json") != selected["runtime"]:
-            raise ValueError("GPU/software differs from the once-only pilot; use a new grid directory")
-        if not evalpilot.ensure(root, bound, selected, runner):
+        forecast = reporting.estimate(root, selected, bound["settings"], end_points)
+        atomic_json(root / "estimate.json", forecast)
+        display(forecast, "Grid runtime estimate (informational; run authorizes execution)")
+        run_trajectories(root, bound, selected, runner, stop, end_points)
+        status = read_json(root / "status.json")
+        if stop.requested:
+            atomic_json(root / "status.json", {**status, "status": "paused"})
             return
-        if not ensure_evaluation(root, bound, None, selected, runner):
+        if status["status"] != "complete":
             return
-        return run_trajectories(root, bound, selected, runner, stop, end_points)
+        from .audit import audit
+        atomic_json(root / "status.json", {**status, "status": "auditing"})
+        result = audit(root, bound, end_points)
+        atomic_json(root / "audit.json", result)
+        display(result, "Grid integrity audit")
+        if result.get("status") not in ("pass", "pass_with_skips"):
+            raise ValueError("Final grid integrity audit did not pass")
+        atomic_json(root / "status.json", {**status, "audit_status": result["status"]})
 
 
 def run_trajectories(root, bound, selected, runner, stop, end_points=schedule.DEFAULT_END_POINTS):

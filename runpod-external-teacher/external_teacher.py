@@ -1,4 +1,4 @@
-"""Explicit external-teacher preparation/validation/grid runner. Plan by default."""
+"""Single-command external-teacher experiment, with automatic restart/reuse. Plan by default."""
 from __future__ import annotations
 
 import argparse
@@ -28,11 +28,11 @@ def main():
     parser.add_argument("--json", action="store_true")
     commands = parser.add_subparsers(dest="command")
     commands.add_parser("plan", help="Read-only; no ML/network/GPU work")
-    execute = commands.add_parser("run", help="ON POD: pinned import, validation, approval and normal grid")
-    execute.add_argument("--accept-pair", action="store_true", help="Approve reviewed compatibility and informational validation reports")
+    execute = commands.add_parser("run", help="ON POD: run/resume imports, validation, automatic calibration, training and audit")
+    execute.add_argument("--accept-pair", action="store_true", help=argparse.SUPPRESS)
     execute.add_argument("--override-quality", action="store_true",
                          help=argparse.SUPPRESS)  # Retired; retained as a no-op for old commands.
-    execute.add_argument("--accept-grid-estimate", action="store_true")
+    execute.add_argument("--accept-grid-estimate", action="store_true", help=argparse.SUPPRESS)
     commands.add_parser("verify", help="Read-only full byte/provenance verification of an approved pair")
     commands.add_parser("dev-smoke", help="DEVELOPMENT ONLY, ON POD: disposable GKD updates and restart diagnostics; not part of run")
     worker = commands.add_parser("_worker", help=argparse.SUPPRESS)

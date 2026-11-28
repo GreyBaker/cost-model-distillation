@@ -28,6 +28,9 @@ def validate(scheme, locked):
     require(scheme["validation"]["periodic_greedy_monitor"] is False, "No periodic greedy monitor")
     require(scheme["compatibility"]["grid_smoke_update_and_resume_required"] is False,
             "Disposable GKD smoke/restart checks are development-only")
+    require(scheme["validation"]["operator_approval_before_binding"] is False
+            and scheme["grid"]["estimate_approval_required"] is False,
+            "The explicit run command must execute without manual approval pauses")
     grid = scheme["grid"]
     require(grid["training_design"] == schedule.DESIGN["kind"], "Grid/LR recipe changed")
     for key in ("lr_horizon", "lr_warmup_points", "lr_cooldown_begin_points", "lr_cooldown_end_points"):
@@ -79,11 +82,11 @@ def build(student="restored"):
     scheme, locked = validate(read(ROOT / "scheme.json"), read(ROOT / "models.lock.json"))
     stages = [
         "preflight_owned_one_disk_paths_and_peak_space",
-        "create_isolated_native_5_20_2_environment_and_freeze_versions",
+        "verify_existing_isolated_native_5_20_2_environment",
     ]
     if student == "restored":
         stages += ["verify_copied_complete_100k_student_read_only",
-                   "create_separate_4_57_6_student_reference_environment"]
+                   "verify_existing_isolated_4_57_6_student_reference_environment"]
     stages += ["download_and_verify_locked_teacher_sources"]
     if student == "public":
         stages += ["download_and_verify_locked_public_student_sources"]
@@ -97,12 +100,12 @@ def build(student="restored"):
     stages += [
         "verify_native_fp32_student_and_bf16_teacher_serialization",
         "full_11332_teacher_and_student_validation_and_paired_difference",
-        "review_and_explicitly_approve_quality_and_compatibility_reports",
+        "display_informational_quality_and_verify_technical_integrity",
         "publish_honest_external_pair_manifest_atomically",
         "bind_new_grid_through_required_external_pair_adapter",
-        "existing_joint_training_fit_pilot",
+        "automatic_joint_training_fit_calibration",
         "existing_once_only_student_inference_calibration_and_full_baseline",
-        "print_measured_estimate_and_wait_for_grid_approval",
+        "print_measured_estimate_and_continue_automatically",
         "train_5_continuous_mixtures_through_160k_with_25_retained_evaluated_prefixes",
         "audit_hashes_points_predictions_and_download_outputs",
     ]
@@ -123,6 +126,8 @@ def build(student="restored"):
         "stages": stages, "grid_cells": cells, "training_design": schedule.DESIGN,
         "grid_trajectories": trajectories,
         "campaign": schedule.campaign(),
+        "execution": {"command": "external_teacher.py run", "manual_stage_or_pilot_commands": False,
+                      "manual_approval_pauses": False, "automatic_calibration": True},
         "development": {"smoke_command": "external_teacher.py dev-smoke", "included_in_standard_run": False},
         "grid_totals": {"cells": len(cells), "training_trajectories": len(trajectories), **{
             key: sum(item[key] for item in trajectories) for key in
@@ -130,7 +135,7 @@ def build(student="restored"):
         "implementation_required": [],
         "warning": "Use external_teacher.py run in the isolated native environment, not the local-SFT pipeline. "
                    "No GPU compatibility/quality claim is made by this plan: the real run enforces validation "
-                   "and approval gates before any grid training.",
+                    "and technical integrity checks before training. Explicit run authorizes the full experiment.",
     }
 
 

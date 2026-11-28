@@ -77,11 +77,7 @@ def commands(sft_work, grid_work, reuse_student=False, reuse_sft=False):
                  ["--accept-reconstructed-recipe", *(["--reuse-student"] if reuse_student else [])])
     return [*preparation,
         ("reuse_sft" if reuse_sft else "sft", [*sft, "run", *sft_flags]),
-        ("bind", [*grid, "bind"]),
-        ("pilot", [*grid, "pilot"]),
-        ("estimate", [*grid, "estimate"]),
-        ("grid", [*grid, "run", "--accept-estimate"]),
-        ("audit", [*grid, "audit"]),
+        ("grid", [*grid, "run"]),
     ]
 
 
@@ -118,11 +114,6 @@ def run(disk, accept_grid_estimate=False, reuse_student=False, reuse_sft=False):
                 if stop.requested:
                     status("paused")
                     return
-                if name == "grid" and not accept_grid_estimate:
-                    status("awaiting_grid_approval", estimate=str(grid_work / "estimate.json"))
-                    print("Review the estimate above, then rerun with --accept-grid-estimate. "
-                          "Existing SFT/pilot results will be reused.", flush=True)
-                    return
                 status(name, command=argv)
                 message(f"Stage {index}/{len(stages)}")
                 started = time.monotonic()
@@ -139,11 +130,7 @@ def run(disk, accept_grid_estimate=False, reuse_student=False, reuse_sft=False):
                     if read_json(sft_work / "status.json").get("phase") != "complete":
                         status("paused", stage=name)
                         return
-                    inspect_pair(sft_work, full=False)  # bind performs full byte verification next.
-                elif name == "pilot":
-                    if read_json(grid_work / "status.json").get("status") != "pilot_ready":
-                        status("paused", stage=name)
-                        return
+                    inspect_pair(sft_work, full=False)  # Grid run verifies all backing bytes next.
                 elif name == "grid":
                     if read_json(grid_work / "status.json").get("status") != "complete":
                         status("paused", stage=name)
@@ -164,11 +151,9 @@ def main():
     plan_reuse = plan.add_mutually_exclusive_group()
     plan_reuse.add_argument("--reuse-student", action="store_true", help="Plan reuse of an existing complete student role")
     plan_reuse.add_argument("--reuse-sft", action="store_true", help="Plan reuse of both completed SFT roles")
-    execute = subs.add_parser("run", help="ON POD: prepare/train SFT, then pilot/estimate/grid/audit")
+    execute = subs.add_parser("run", help="Historical SFT workflow, then a single automatic grid run")
     execute.add_argument("--accept-reconstructed-recipe", action="store_true")
-    execute.add_argument("--accept-grid-estimate", action="store_true",
-                         help="Authorize unattended grid launch after its measured estimate is printed; "
-                               "otherwise pause for review before grid training")
+    execute.add_argument("--accept-grid-estimate", action="store_true", help=argparse.SUPPRESS)
     execute_reuse = execute.add_mutually_exclusive_group()
     execute_reuse.add_argument("--reuse-student", action="store_true",
                          help="Verify SFT_WORK/student and skip student preparation/training/export/evaluation")
@@ -183,7 +168,7 @@ def main():
                 "reuse_sft": getattr(args, "reuse_sft", False),
                 "prerequisites": "One disposable POD_DISK, both source folders and the SFT venv already set up.",
                 "approval": "SFT training requires recipe acceptance; --reuse-sft only verifies restored roles. "
-                            "Without --accept-grid-estimate, pause before grid training."},
+                             "The grid runs automatically, including calibration and audit."},
                "SFT to GKD pipeline", args.json)
         return
     if args.pod_disk is None:

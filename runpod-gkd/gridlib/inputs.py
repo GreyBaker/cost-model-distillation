@@ -100,5 +100,5 @@ def binding(root, sft_work, settings, create=False, full=True):
         root.mkdir(parents=True, exist_ok=True)
         atomic_json(path, definition)
     else:
-        raise ValueError("Run bind after both SFT roles finish")
+        raise ValueError("Use run to automatically verify and bind the completed model pair")
     return definition

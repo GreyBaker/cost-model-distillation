@@ -35,7 +35,7 @@ def main(argv=None):
     selection.add_argument("--quality-report", "--quality-override", dest="quality_report", action="store_true",
                            help="Run only informational-quality, integrity and legacy-compatibility checks")
     selection.add_argument("--model-config", action="store_true",
-                           help="Run only untied export-config normalization and model-contract checks")
+                           help="Run only source-config preservation, warning visibility and model-contract checks")
     selection.add_argument("--all", action="store_true", help="Run the full regression suite (default)")
     args = parser.parse_args(argv)
     blocker = NoML()

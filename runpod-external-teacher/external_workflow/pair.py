@@ -189,7 +189,7 @@ def inspect(root, full=True, check_runtime=True, *, _candidate=None):
     approval = pair.get("approval", {})
     if (approval.get("accepted") is not True or approval.get("definition_sha256") != digest(definition)
             or approval.get("quality_complete_sha256") != pair["artifacts"]["quality"]["complete_sha256"]):
-        raise ValueError("Explicit external-pair approval is missing or stale")
+        raise ValueError("External-pair acceptance record is missing or stale")
     if legacy_smoke:
         if (markers["smoke"]["identity"] != stage_identity(definition, "smoke", models={
                 role: pair["artifacts"][role]["complete_sha256"] for role in ("student", "teacher")})
@@ -240,7 +240,8 @@ def approve(work):
              "runtime": read_json(Path(work) / "native_runtime.json"),
              "approval": {"accepted": True, "definition_sha256": digest(definition),
                           "quality_complete_sha256": artifacts["quality"]["complete_sha256"],
-                           "unix_time": time.time(), "source_fingerprints": code()}}
+                          "authorization": "single-command run after technical verification; quality informational",
+                          "unix_time": time.time(), "source_fingerprints": code()}}
     # Validate all backing evidence BEFORE publishing a complete pair.
     inspect(root, _candidate=value)
     atomic_json(root / "prepared_pair.json", value)

@@ -15,7 +15,7 @@ from unittest.mock import patch
 
 import external_teacher
 from external_workflow import common, controller, evaluation, pair, quality_policy, reporting
-from gridlib import inputs
+from gridlib import inputs, schedule
 from quality_override_fixture import RUNTIME, artifact, failed_pair
 from sftlib.core import atomic_json, read_json, sha256, tree_manifest
 
@@ -104,7 +104,6 @@ class ReportIntegrationTests(unittest.TestCase):
     def test_cached_failed_reports_resume_without_override_or_score_comparison(self):
         root, work, definition = self.root, self.work, self.definition
         before, run_before = tree_manifest(root), (work / "run.json").read_bytes()
-        self.assertEqual(set(controller.reviewed_pair(work)), {"quality"})
         code = self.disk / "mock-code"
         code.mkdir()
         shutil.copyfile(root / "models.lock.json", code / "models.lock.json")
@@ -119,11 +118,11 @@ class ReportIntegrationTests(unittest.TestCase):
             return True
         def call(runner, argv, name, **kwargs):
             calls.append(name)
-            if name == "grid-bind":
+            if name == "grid-run":
                 result = inputs.inspect_pair(root, full=True)
                 self.assertEqual(result["external_provenance"]["quality_policy"], "informational-only")
-            if name == "grid-pilot":
-                atomic_json(grid / "status.json", {"status": "pilot_ready"})
+                atomic_json(grid / "status.json", {"status": "complete"})
+                atomic_json(grid / "binding.json", {"training_design": schedule.DESIGN})
             return True
         current_definition = {key: value for key, value in definition.items() if key != "thresholds"}
         with patch.object(controller, "operational_paths", return_value=(self.disk, work, grid)), \
@@ -134,18 +133,17 @@ class ReportIntegrationTests(unittest.TestCase):
                 patch.object(pair, "environment", return_value=RUNTIME["environment"]), \
                 patch.dict(os.environ, {}, clear=False), contextlib.redirect_stdout(io.StringIO()) as console:
             controller.run(args)
-            self.assertEqual(calls[-1], "quality")
+            self.assertEqual(calls[-1], "grid-run")
             self.assertNotIn("smoke", calls)
-            self.assertFalse(any(name.startswith("grid-") for name in calls))
-            self.assertEqual(read_json(work / "status.json")["phase"], "awaiting_pair_approval")
+            self.assertEqual(read_json(work / "status.json")["phase"], "complete")
             self.assertFalse((root / quality_policy.RELATIVE).exists())
             # Even a stale, incomplete old waiver is irrelevant to a new approval.
             atomic_json(root / quality_policy.RELATIVE / "report.json", {"old_incomplete_record": True})
             args.accept_pair, args.accept_grid_estimate = True, False
             controller.run(args)
-            self.assertEqual(calls[-3:], ["grid-bind", "grid-pilot", "grid-estimate"])
-            self.assertNotIn("grid-run", calls)
-            self.assertEqual(read_json(work / "status.json")["phase"], "awaiting_grid_approval")
+            self.assertEqual(calls[-1], "grid-run")
+            self.assertFalse(set(calls) & {"grid-bind", "grid-pilot", "grid-estimate"})
+            self.assertEqual(read_json(work / "status.json")["phase"], "complete")
         text = console.getvalue()
         for expected in ("Student full validation: rouge1=10.010000, rouge2=10.010000, rougeL=10.010000",
                          "Teacher full validation: rouge1=20.900000, rouge2=20.900000, rougeL=20.900000",

@@ -139,7 +139,7 @@ class ScheduleTests(unittest.TestCase):
                         "protocol": policy.PROTOCOL, "settings": policy.settings()})
             atomic_json(root / "trajectories/on000/run.json", {"old_history": "preserve"})
             before = tree_manifest(root)
-            for operation in ("bind", "run", "pilot", "estimate", "summary", "audit"):
+            for operation in ("run", "estimate", "summary", "audit"):
                 with self.subTest(operation=operation), patch.object(sys, "argv", [
                         "distill_grid.py", "--work-dir", str(root), operation]), \
                         patch("sftlib.core.configure_local_storage",
@@ -214,7 +214,7 @@ class ScheduleTests(unittest.TestCase):
 
     def test_obsolete_grid_is_rejected_by_every_operational_cli_before_any_writes(self):
         operations = [
-            ["bind"], ["pilot"], ["estimate"], ["summary"], ["audit"],
+            ["estimate"], ["summary"], ["audit"],
             ["run"], ["run", "--accept-estimate"], ["_runtime"],
             ["_pilot"], ["_evaluation_pilot"],
             ["_train", "--cell", "p05000_on000"], ["_evaluate", "--cell", "p05000_on000"],
@@ -460,6 +460,114 @@ class TrainingTests(unittest.TestCase):
 
 
 class OrchestrationTests(unittest.TestCase):
+    def test_single_cli_run_binds_before_cache_setup_without_manual_prerequisites(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d) / "new-grid"
+            order = []
+            def setup(path):
+                self.assertTrue((path / "binding.json").is_file())
+                order.append("storage")
+            def run(path, bound, settings_path, end_points):
+                self.assertEqual(bound["training_design"], schedule.DESIGN)
+                self.assertEqual(end_points, 160000)
+                order.append("run")
+            with patch.object(sys, "argv", ["distill_grid.py", "--work-dir", str(root), "run"]), \
+                    patch.object(inputs, "separate_work"), \
+                    patch.object(inputs, "inspect_pair", return_value={"kind": "test-pair"}), \
+                    patch.object(inputs, "code_signature", return_value={"code": "provenance"}), \
+                    patch("sftlib.core.configure_local_storage", side_effect=setup), \
+                    patch.object(controller, "run", side_effect=run):
+                distill_grid.main()
+            self.assertEqual(order, ["storage", "run"])
+            self.assertTrue((root / "binding.json").exists())
+
+    def test_manual_bind_and_pilot_commands_are_removed(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d) / "absent"
+            for operation in ("bind", "pilot"):
+                with self.subTest(operation=operation), patch.object(sys, "argv", [
+                        "distill_grid.py", "--work-dir", str(root), operation]), \
+                        contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as error:
+                    distill_grid.main()
+                self.assertEqual(error.exception.code, 2)
+                self.assertFalse(root.exists())
+
+    def test_single_grid_run_automatically_calibrates_baseline_trains_and_audits_then_reuses_fit(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            bound = {"training_design": schedule.DESIGN, "settings": policy.settings(),
+                     "protocol": policy.PROTOCOL, "inputs": {"sft_work": "pair"}}
+            atomic_json(root / "binding.json", bound)
+            runtime, events = {"mock": True}, []
+            def call(runner, operation, name, *extra):
+                if operation == "runtime":
+                    events.append("runtime")
+                    atomic_json(root / "runtime.json", runtime)
+                elif operation == "pilot":
+                    events.append("fit")
+                    batch = int(extra[extra.index("--microbatch") + 1])
+                    online = bool(int(extra[extra.index("--online") + 1]))
+                    output = Path(extra[extra.index("--output") + 1])
+                    atomic_json(output, {"microbatch": batch, "online": online, "status": "pass",
+                                "runtime": runtime, "binding_sha256": sha256(root / "binding.json"),
+                                "mean_update_seconds": 32 / batch})
+                else:
+                    raise AssertionError(operation)
+                return True
+            def mark(name, result):
+                def execute(*args, **kwargs):
+                    events.append(name)
+                    return result
+                return execute
+            def train(*args, **kwargs):
+                events.append("train")
+                atomic_json(root / "status.json", {"status": "complete", "complete_cells": 25})
+            with patch.object(controller.Runner, "call", call), \
+                    patch.object(controller.evalpilot, "ensure", side_effect=mark("evaluation_calibration", True)), \
+                    patch.object(controller, "ensure_evaluation", side_effect=mark("baseline", True)), \
+                    patch.object(reporting, "estimate", side_effect=mark("estimate", {"mock_estimate": True})), \
+                    patch.object(controller, "run_trajectories", side_effect=train), \
+                    patch.object(audit, "audit", side_effect=mark("audit", {"status": "pass"})), \
+                    contextlib.redirect_stdout(io.StringIO()):
+                controller.run(root, bound, Path("settings.json"))
+                self.assertEqual(events.count("fit"), 2 * len(bound["settings"]["pilot_microbatches"]))
+                self.assertEqual(events[-5:], ["evaluation_calibration", "baseline", "estimate", "train", "audit"])
+                fit_hash = sha256(root / "pilot.json")
+                events.clear()
+                controller.run(root, bound, Path("settings.json"))
+                self.assertNotIn("fit", events)
+                self.assertEqual(sha256(root / "pilot.json"), fit_hash)
+                self.assertEqual(events[-5:], ["evaluation_calibration", "baseline", "estimate", "train", "audit"])
+            self.assertEqual(read_json(root / "status.json")["audit_status"], "pass")
+            self.assertEqual(read_json(root / "audit.json")["status"], "pass")
+
+    def test_interrupted_automatic_calibration_does_not_start_training_or_audit(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            bound = {"training_design": schedule.DESIGN, "inputs": {"sft_work": "pair"}}
+            with patch.object(controller, "calibrate", return_value=None), \
+                    patch.object(controller, "run_trajectories", side_effect=AssertionError("No training")), \
+                    patch.object(audit, "audit", side_effect=AssertionError("No audit")):
+                controller.run(root, bound, Path("settings.json"))
+            self.assertEqual(read_json(root / "status.json")["status"], "paused")
+
+    def test_single_run_does_not_mark_failed_audit_as_complete(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            bound = {"training_design": schedule.DESIGN, "settings": policy.settings(),
+                     "inputs": {"sft_work": "pair"}}
+            def trained(*args, **kwargs):
+                atomic_json(root / "status.json", {"status": "complete"})
+            with patch.object(controller, "calibrate", return_value={"mock": True}), \
+                    patch.object(reporting, "estimate", return_value={}), \
+                    patch.object(controller, "run_trajectories", side_effect=trained), \
+                    patch.object(audit, "audit", return_value={"status": "fail"}), \
+                    contextlib.redirect_stdout(io.StringIO()), \
+                    self.assertRaisesRegex(ValueError, "Final grid integrity audit did not pass"):
+                controller.run(root, bound, Path("settings.json"))
+            self.assertNotEqual(read_json(root / "status.json")["status"], "complete")
+            self.assertEqual(read_json(root / "audit.json")["status"], "fail")
+
     def test_evaluation_oom_uses_retained_snapshot_and_repairs_cached_pointer(self):
         with tempfile.TemporaryDirectory() as d:
             root = Path(d)

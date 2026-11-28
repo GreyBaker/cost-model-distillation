@@ -273,8 +273,9 @@ class DownloadTests(unittest.TestCase):
 
 
 class ControllerTests(unittest.TestCase):
-    def execute(self, root, accept_pair=False, accept_grid=False, quality=True, pause_grid=False, oom=False):
-        work, grid = root / "work", root / "grid"
+    def execute(self, root, accept_pair=False, accept_grid=False, quality=True, pause_grid=False, oom=False,
+                grid_name="grid"):
+        work, grid = root / "work", root / grid_name
         args = SimpleNamespace(pod_disk=root, work_dir=work, grid_work=grid, student="public", restored_root=None,
             reference_python=None, min_teacher_r2=20., min_advantage=1., min_ci_lower=0.,
             minimum_free_gib=0., settings=common.REPO / "runpod-gkd/settings.json",
@@ -291,18 +292,19 @@ class ControllerTests(unittest.TestCase):
             if stage == "quality":
                 atomic_json(work / "pair/reports/quality/report.json", {"passed": quality, "scores": {}})
             return True
-        def call(self, argv, name, **kwargs):
+        def call(runner, argv, name, **kwargs):
             calls.append(name)
-            if name == "grid-pilot":
-                atomic_json(grid / "status.json", {"status": "pilot_ready"})
             if name == "grid-run":
+                self.assertEqual(argv[-1], "run")
+                self.assertNotIn("--accept-estimate", argv)
                 atomic_json(grid / "status.json", {"status": "paused" if pause_grid else "complete"})
+                if not pause_grid:
+                    atomic_json(grid / "audit.json", {"status": "pass"})
             self_args = argv
             if any("prepare_models.py" in arg for arg in self_args):
                 raise AssertionError("External workflow must never launch SFT")
             return True
         with patch.object(controller, "operational_paths", return_value=(root, work, grid)), \
-                patch.object(controller, "reviewed_pair", return_value={}), \
                 patch.dict(os.environ, {}, clear=False), \
                 patch.object(controller, "configure_local_storage"), patch.object(controller, "runtime"), \
                 patch.object(controller, "check_space"), patch.object(controller.Runner, "worker", worker), \
@@ -311,29 +313,42 @@ class ControllerTests(unittest.TestCase):
             controller.run(args)
         return work, calls, batches, approval.call_count
 
-    def test_default_pauses_before_pair_binding(self):
+    def test_one_run_completes_without_manual_approval_or_pilot_commands(self):
         with tempfile.TemporaryDirectory() as d:
             work, calls, _, approvals = self.execute(Path(d))
-            self.assertEqual(read_json(work / "status.json")["phase"], "awaiting_pair_approval")
-            self.assertEqual(approvals, 0)
-            self.assertNotIn("grid-bind", calls)
-            self.assertEqual(calls[-1], "quality")
+            self.assertEqual(read_json(work / "status.json")["phase"], "complete")
+            self.assertEqual(approvals, 1)
+            self.assertEqual(calls[-2:], ["quality", "grid-run"])
+            self.assertFalse(set(calls) & {"grid-bind", "grid-pilot", "grid-estimate", "grid-audit"})
             self.assertNotIn("smoke", calls)
             self.assertEqual(calls[:2], ["native-runtime", "acquire"])
 
-    def test_pair_approval_runs_pilots_then_pauses_for_estimate(self):
+    def test_legacy_acceptance_flags_do_not_create_extra_pauses(self):
         with tempfile.TemporaryDirectory() as d:
             work, calls, _, approvals = self.execute(Path(d), accept_pair=True)
             self.assertEqual(approvals, 1)
-            self.assertEqual(calls[-3:], ["grid-bind", "grid-pilot", "grid-estimate"])
-            self.assertEqual(read_json(work / "status.json")["phase"], "awaiting_grid_approval")
+            self.assertEqual(calls[-1], "grid-run")
+            self.assertEqual(read_json(work / "status.json")["phase"], "complete")
 
-    def test_both_approvals_run_and_audit_full_grid_but_not_after_graceful_pause(self):
+    def test_single_grid_command_owns_audit_and_graceful_pause_is_not_completion(self):
         for pause in (False, True):
             with self.subTest(pause=pause), tempfile.TemporaryDirectory() as d:
                 work, calls, _, _ = self.execute(Path(d), accept_pair=True, accept_grid=True, pause_grid=pause)
-                self.assertEqual("grid-audit" in calls, not pause)
+                self.assertEqual((Path(d) / "grid/audit.json").exists(), not pause)
                 self.assertEqual(read_json(work / "status.json")["phase"], "paused" if pause else "complete")
+
+    def test_existing_external_work_can_select_new_grid_without_rewriting_pair_definition(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            work, _, _, _ = self.execute(root)
+            before = (work / "run.json").read_bytes()
+            frozen = read_json(work / "run.json")["definition"]
+            self.execute(root, grid_name="new-160k-grid")
+            self.assertEqual((work / "run.json").read_bytes(), before)
+            self.assertEqual(read_json(work / "run.json")["definition"], frozen)
+            invocations = [json.loads(line) for line in (work / "experiment_invocations.jsonl").read_text().splitlines()]
+            self.assertEqual(invocations[-1]["grid_work"], str(root / "new-160k-grid"))
+            self.assertEqual(invocations[-1]["pair_definition_sha256"], common.digest(frozen))
 
     def test_low_quality_is_informational_and_does_not_block_the_grid(self):
         with tempfile.TemporaryDirectory() as d:
@@ -498,6 +513,10 @@ class ModelContractTests(unittest.TestCase):
                 model = Model()
                 if (path / "config.json").is_file():
                     model.config = SimpleNamespace(**read_json(path / "config.json"))
+                if path != source:
+                    # A library may represent tying metadata differently on reload.
+                    # Actual tensor/scaling/numerical parity, not a rewritten flag, is authoritative.
+                    model.config.tie_word_embeddings = False
                 return model
             probe_flags = []
             def probe(model, *args, **kwargs):
@@ -512,23 +531,39 @@ class ModelContractTests(unittest.TestCase):
                     patch.object(models, "load_model", side_effect=load_model) as load, \
                     patch.object(models, "load_tokenizer", return_value=tokenizer), \
                     patch.object(models, "probe_rows", return_value=[]), \
-                    patch.object(models, "inventory", return_value=inv), \
+                    patch.object(models, "inventory", return_value=inv) as inventories, \
                     patch.object(models, "tensors_and_gradients", side_effect=probe), \
                     patch.object(models, "compare", return_value={"rtol": 1e-4, "atol": 1e-4, "max_abs_error": 0}), \
                     patch.object(models, "make_inputs", return_value=({}, None)), \
                     patch.object(models, "greedy", return_value=ids), patch.object(models, "check_space"):
+                # Removing flag normalization must not weaken actual tensor/alias checks.
+                inventories.side_effect = [inv, inv, {**inv, "unique_parameters": 2}]
+                with self.assertRaisesRegex(ValueError, "Native serialization changed parameter aliases"):
+                    models.export(work, "student")
+                self.assertFalse((work / "pair/models/student_fp32").exists())
+                incomplete = {path: tree_manifest(path) for path in
+                              (work / "pair/models").glob(".student_fp32-*.incomplete")}
+                self.assertTrue(incomplete)
+                inventories.side_effect = None
+                load.reset_mock()
+                probe_flags.clear()
+                # A retry starts a new attempt; failed/incomplete evidence is not edited/deleted.
                 models.export(work, "student")
+                for path, manifest in incomplete.items():
+                    self.assertEqual(tree_manifest(path), manifest)
             self.assertEqual(load.call_count, 2)
-            self.assertEqual(probe_flags, [True, False, False])
+            self.assertEqual(probe_flags, [True, False])
             exported = work / "pair/models/student_fp32"
             common.verify(exported, common.identity(work, "model", role="student"))
             provenance = read_json(exported / "provenance.json")
             self.assertEqual(provenance["origin"], "external-public-sft")
             self.assertEqual(provenance["local_sft_updates"], 0)
             self.assertEqual(provenance["historical_steps_status"], "publisher-reported")
-            self.assertFalse(read_json(exported / "config.json")["tie_word_embeddings"])
-            self.assertTrue(provenance["config_normalization"]["source_loaded_config"]["tie_word_embeddings"])
-            self.assertFalse(provenance["config_normalization"]["export_config"]["tie_word_embeddings"])
+            self.assertTrue(read_json(exported / "config.json")["tie_word_embeddings"])
+            self.assertTrue(provenance["config_observations"]["source_loaded"]["tie_word_embeddings"])
+            self.assertTrue(provenance["config_observations"]["before_save"]["tie_word_embeddings"])
+            self.assertFalse(provenance["config_observations"]["reloaded"]["tie_word_embeddings"])
+            self.assertNotIn("config_normalization", provenance)
             self.assertFalse((exported / "training_state.pt").exists())
             self.assertEqual(tree_manifest(source), before)
 
@@ -593,23 +628,6 @@ class EvidenceTests(unittest.TestCase):
                 else:
                     with self.assertRaises(ValueError):
                         external_data.raw(Path("unused"))
-
-    def test_approval_cannot_be_given_before_reports_exist(self):
-        with tempfile.TemporaryDirectory() as d:
-            with self.assertRaisesRegex(ValueError, "without --accept-pair"):
-                controller.reviewed_pair(Path(d))
-
-    def test_approval_requires_passed_sealed_reports_and_binds_their_hashes(self):
-        with tempfile.TemporaryDirectory() as d:
-            work = Path(d)
-            for stage in ("quality",):
-                artifact(work / "pair", "reports/" + stage, {"stage": stage},
-                         {"report.json": {"passed": True}})
-            reviewed = controller.reviewed_pair(work)
-            self.assertEqual(set(reviewed), {"quality"})
-            (work / "pair/reports/quality/report.json").write_text('{"passed":false}')
-            with self.assertRaises(ValueError):
-                controller.reviewed_pair(work)
 
     def test_invalid_pair_is_not_published_even_with_a_passed_quality_flag(self):
         with tempfile.TemporaryDirectory() as d:

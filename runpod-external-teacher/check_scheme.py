@@ -57,17 +57,20 @@ class SchemeTests(unittest.TestCase):
             with self.subTest(key=key), self.assertRaisesRegex(ValueError, "Grid.*(recipe|schedule) changed"):
                 plan.validate(changed, locked)
 
-    def test_all_approvals_precede_grid_training(self):
+    def test_single_command_verifies_and_reports_without_manual_workflow_pauses(self):
         stages = plan.build()["stages"]
         self.assertLess(stages.index("full_11332_teacher_and_student_validation_and_paired_difference"),
                         stages.index("publish_honest_external_pair_manifest_atomically"))
-        self.assertLess(stages.index("review_and_explicitly_approve_quality_and_compatibility_reports"),
+        self.assertLess(stages.index("display_informational_quality_and_verify_technical_integrity"),
                         stages.index("publish_honest_external_pair_manifest_atomically"))
         self.assertNotIn("disposable_gkd_update_save_reload_resume_smoke_test", stages)
         self.assertEqual(plan.build()["development"], {
             "smoke_command": "external_teacher.py dev-smoke", "included_in_standard_run": False})
-        self.assertLess(stages.index("print_measured_estimate_and_wait_for_grid_approval"),
+        self.assertLess(stages.index("print_measured_estimate_and_continue_automatically"),
                          stages.index("train_5_continuous_mixtures_through_160k_with_25_retained_evaluated_prefixes"))
+        self.assertEqual(plan.build()["execution"], {
+            "command": "external_teacher.py run", "manual_stage_or_pilot_commands": False,
+            "manual_approval_pauses": False, "automatic_calibration": True})
 
     def test_pins_weights_and_equal_public_tokenizer_file_identities(self):
         locked = plan.read(plan.ROOT / "models.lock.json")

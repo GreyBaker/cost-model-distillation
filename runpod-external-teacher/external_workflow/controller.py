@@ -20,17 +20,6 @@ class ExternalOOM(RuntimeError):
     pass
 
 
-def reviewed_pair(work):
-    """Approval applies only to evidence already available before this invocation."""
-    from .common import verify
-    directory = pair_root(work) / "reports/quality"
-    if not (directory / "COMPLETE.json").is_file():
-        raise ValueError("Run without --accept-pair first, then review the completed quality report")
-    verify(directory)
-    result = {"quality": sha256(directory / "COMPLETE.json")}
-    return result
-
-
 def worker_command(work, stage, python=None, batch=None, attempt=None):
     argv = [str(python or sys.executable), "-u", "-B", str(ROOT / "external_teacher.py"),
             "--work-dir", str(work), "_worker", "--stage", stage]
@@ -146,9 +135,12 @@ def run(args):
         if path.exists():
             original = read_json(path)
             # Old thresholds are archived metadata, not a resume/admission policy.
-            effective = lambda definition: {key: item for key, item in definition.items() if key != "thresholds"}
+            # Grid destination is operational, not part of immutable pair evidence.
+            # Preserve the original definition/hashes even when selecting a new grid.
+            effective = lambda definition: {key: item for key, item in definition.items()
+                                            if key not in ("thresholds", "grid_work")}
             if effective(original["definition"]) != effective(value):
-                raise ValueError("Mode, source, settings or work paths changed; use a NEW external/grid root")
+                raise ValueError("Mode, source or settings changed; preserve this external work root")
             value = original["definition"]  # Preserve hashes of all completed legacy artifacts.
             if original.get("source_fingerprints") != code():
                 message("WARNING: source changed; valid artifacts/resumes are reused without a code-hash gate.")
@@ -171,7 +163,9 @@ def run(args):
             else:
                 shutil.copyfile(source, target)
         append(work / "source_provenance.jsonl", {"source_fingerprints": code()})
-        reviewed = reviewed_pair(work) if args.accept_pair else None
+        append(work / "experiment_invocations.jsonl", {
+            "grid_work": str(grid), "pair_definition_sha256": digest(value),
+            "authorization": "explicit single-command run; no manual approval pauses"})
         runner = Runner(work, stop)
 
         def status(phase, **extra):
@@ -226,36 +220,16 @@ def run(args):
                 return
             report = read_json(pair_root(work) / "reports/quality/report.json")
             display_quality(work, report)
-            if not args.accept_pair:
-                status("awaiting_pair_approval", report=report)
-                message("Review reports, then rerun unchanged arguments with --accept-pair.")
-                return
-            if reviewed_pair(work) != reviewed:
-                raise ValueError("Pair evidence changed during this invocation; review reports before approval")
             from .pair import approve
             approve(work)
             prefix = [sys.executable, "-u", "-B", str(REPO / "runpod-gkd/distill_grid.py"),
                       "--sft-work", str(pair_root(work)), "--work-dir", str(grid),
                       "--settings", str(work / "grid_settings.json")]
-            for stage in ("bind", "pilot", "estimate"):
-                status("grid_" + stage)
-                if not runner.call([*prefix, stage], "grid-" + stage):
-                    status("paused")
-                    return
-                if stage == "pilot" and read_json(grid / "status.json").get("status") != "pilot_ready":
-                    status("paused")
-                    return
-            if not args.accept_grid_estimate:
-                status("awaiting_grid_approval", estimate=str(grid / "estimate.json"))
-                message("Review measured estimate; rerun also with --accept-grid-estimate.")
-                return
-            if not runner.call([*prefix, "run", "--accept-estimate"], "grid-run"):
+            status("grid_running", grid=str(grid))
+            if not runner.call([*prefix, "run"], "grid-run"):
                 status("paused")
                 return
             if read_json(grid / "status.json").get("status") != "complete":
-                status("paused")
-                return
-            if not runner.call([*prefix, "audit"], "grid-audit"):
                 status("paused")
                 return
             status("complete", grid=str(grid))

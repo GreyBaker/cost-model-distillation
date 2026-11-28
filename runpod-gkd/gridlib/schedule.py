@@ -45,7 +45,8 @@ def validate_root(root, *, allow_new=False):
             raise ValueError("Old independent-cell grid directories are unsupported; use a NEW grid directory.")
         return bound
     if not allow_new:
-        raise ValueError("No continuous grid binding; use a NEW grid directory and run bind.")
+        raise ValueError("No continuous grid binding; run the experiment with the single run command "
+                         "in a NEW grid directory.")
     if root.exists() and any(entry.name not in (".controller.lock", ".worker.lock")
                              for entry in root.iterdir()):
         raise ValueError("Nonempty grid directory without a continuous binding; use a NEW grid directory.")

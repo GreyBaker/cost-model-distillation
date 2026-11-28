@@ -29,36 +29,10 @@ def inventory(model):
                                                     model.config.tie_word_embeddings))}
 
 
-def normalize_export_config(model):
-    """Describe actual untied parameters without changing weights or decoder scaling."""
-    before = inventory(model)
-    if before["scale_decoder_outputs"] is not False:
-        raise ValueError("Config normalization must not change decoder logit scaling")
-    source_config = {
-        "tie_word_embeddings": model.config.tie_word_embeddings,
-        "scale_decoder_outputs": getattr(model.config, "scale_decoder_outputs", None),
-    }
-    embeddings, output = model.get_input_embeddings(), model.get_output_embeddings()
-    if embeddings is None or output is None:
-        raise ValueError("T5 export requires input and output embeddings")
-    tied = embeddings.weight is output.weight
-    if not tied:
-        if embeddings.weight.untyped_storage().data_ptr() == output.weight.untyped_storage().data_ptr():
-            raise ValueError("Distinct input/output parameters share storage; cannot normalize as untied")
-        model.config.tie_word_embeddings = False
-    # Older restored configs may encode this through tie_word_embeddings=False.
-    # Make the already-verified behavior explicit for the native derived export.
-    model.config.scale_decoder_outputs = False
-    if inventory(model) != before:
-        raise ValueError("Config normalization changed parameter aliases, dimensions or scaling")
-    return {
-        "kind": "actual-input-output-parameter-config-v1",
-        "source_loaded_config": source_config,
-        "export_config": {"tie_word_embeddings": model.config.tie_word_embeddings,
-                          "scale_decoder_outputs": model.config.scale_decoder_outputs},
-        "input_output_parameter_tied": tied,
-        "note": "Derived config only; source files and parameter/storage aliases are unchanged.",
-    }
+def config_observation(model):
+    """Record library metadata without rewriting tying/scaling or hiding warnings."""
+    return {key: getattr(model.config, key, None)
+            for key in ("tie_word_embeddings", "scale_decoder_outputs")}
 
 
 def load_model(path, device, precision="float32", reference=False):
@@ -225,6 +199,7 @@ def export(work, role):
     source_path = verified_model_source(work, role)
     canonical_tokenizer = load_tokenizer(student_source(work))
     model = load_model(source_path, device)
+    config_observations = {"source_loaded": config_observation(model)}
     before_inventory = inventory(model)
     rows = probe_rows(work)
     reference = None
@@ -245,14 +220,6 @@ def export(work, role):
             raise ValueError("Cross-version greedy student trajectories changed")
     model.config.external_pair_profile = PROFILE
     model.config.use_cache = True
-    normalization = normalize_export_config(model)
-    normalized = tensors_and_gradients(model, canonical_tokenizer, rows, device,
-                                       gradient=role == "student", fixed=before)
-    normalization["parity"] = compare(normalized, before)
-    del normalized
-    inputs, _ = make_inputs(model, canonical_tokenizer, rows, device)
-    if not torch.equal(greedy(model, canonical_tokenizer, inputs).cpu(), before["generated"]):
-        raise ValueError("Config normalization changed greedy generation")
     if role == "teacher":
         model.requires_grad_(False)
         model.to(torch.bfloat16)
@@ -282,15 +249,14 @@ def export(work, role):
         drift = None
     check_space(final.parent, int(sum(p.numel() * p.element_size() for p in model.parameters()) * 1.2) + 1024 ** 3)
     scratch = temporary(final)
+    config_observations["before_save"] = config_observation(model)
     model.save_pretrained(scratch, safe_serialization=True, max_shard_size="2GB")
     canonical_tokenizer.save_pretrained(scratch)
     saved_inventory = inventory(model)
     del model
     torch.cuda.empty_cache()
     reloaded = load_model(scratch, device, precision="float32" if role == "student" else "bfloat16")
-    if any(getattr(reloaded.config, key, None) != value
-           for key, value in normalization["export_config"].items()):
-        raise ValueError("Native serialization changed the normalized embedding/scaling config")
+    config_observations["reloaded"] = config_observation(reloaded)
     after_inventory = inventory(reloaded)
     if saved_inventory != after_inventory:
         raise ValueError("Native serialization changed parameter aliases, dimensions or scaling")
@@ -308,7 +274,7 @@ def export(work, role):
         "local_sft_updates": 0, "historical_steps": 100000 if role == "student" else 8000,
         "historical_steps_status": "verified-local-completion" if reference is not None else "publisher-reported",
         "profile": PROFILE, "runtime": info, "inventory": after_inventory,
-        "config_normalization": normalization,
+        "config_observations": config_observations,
         "probe_generation_precision": "bfloat16" if role == "teacher" else "float32",
         "migration": comparison, "reload_parity": parity, "fp32_bf16_drift": drift,
         "tokenizer": "audited canonical student tokenizer, exact token-ID identity"})

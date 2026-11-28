@@ -22,11 +22,9 @@ def main():
                         help="Active endpoint up to 160000; the intended LR horizon remains 160K")
     commands = parser.add_subparsers(dest="command")
     commands.add_parser("plan", help="Read-only grid/count/runtime scenarios; no ML imports")
-    commands.add_parser("bind", help="Verify/freeze completed SFT or approved external pair (hashes; no GPU/model load)")
-    commands.add_parser("pilot", help="ON POD: once-only training fit and evaluation batch pilots, then full baseline")
     commands.add_parser("estimate", help="Read-only measured full-grid estimate from saved pilot/baseline")
-    run = commands.add_parser("run", help="Print estimate; execute only with --accept-estimate")
-    run.add_argument("--accept-estimate", action="store_true")
+    run = commands.add_parser("run", help="ON POD: automatically bind, calibrate, validate, train/resume and audit")
+    run.add_argument("--accept-estimate", action="store_true", help=argparse.SUPPRESS)
     commands.add_parser("summary", help="Write JSON/CSV/Markdown summary without ML imports")
     commands.add_parser("audit", help="Offline final-grid hashes/counts/coverage audit; no ML imports")
     for name in ("_train", "_evaluate", "_pilot", "_evaluation_pilot", "_runtime"):
@@ -45,7 +43,7 @@ def main():
         display({**policy.plan(args.end_points), "settings": settings}, "Point-budget GKD plan", args.json)
         return
     root, sft_work = args.work_dir.resolve(), args.sft_work.resolve()
-    schedule.validate_root(root, allow_new=operation == "bind")
+    schedule.validate_root(root, allow_new=operation == "run")
     if operation == "summary":
         from gridlib.reporting import summary
         if not root.is_dir():
@@ -55,7 +53,7 @@ def main():
         return
     from gridlib.inputs import binding, separate_work
     separate_work(root, sft_work)
-    if operation == "estimate" or (operation == "run" and not args.accept_estimate):
+    if operation == "estimate":
         from gridlib.controller import saved_pilot
         from gridlib.reporting import estimate
         # Read only: no locks/directories/files are created and no CUDA is touched.
@@ -63,34 +61,20 @@ def main():
         display(estimate(root, saved_pilot(root), settings, args.end_points), "Grid runtime estimate", args.json)
         return
     lock_name = ".worker.lock" if operation.startswith("_") else ".controller.lock"
-    if operation in ("pilot", "run", "_runtime", "_pilot", "_evaluation_pilot", "_train", "_evaluate"):
-        from sftlib.core import configure_local_storage
-        configure_local_storage(root)
     with RunLock(root / lock_name):
-        bound = binding(root, sft_work, settings, create=operation == "bind", full=operation == "bind")
-        if operation == "bind":
-            print("Verified validated external pair; no model loaded or GPU used."
-                  if bound["inputs"].get("kind") == "validated-external-pair-v1"
-                  else "Verified completed 100K/8K SFT pair; no model loaded or GPU used.")
-            print(f"Continuous design: five mixtures through {args.end_points:,} nominal points each; "
-                  f"{len(schedule.active_milestones(args.end_points))} retained/evaluated milestones. "
-                  "160K LR horizon: 8K warmup, 120K–160K cooldown; rolling recovery every 5,000 points.")
-        elif operation == "audit":
+        bound = binding(root, sft_work, settings, create=operation == "run", full=operation == "run")
+        if operation.startswith("_"):
+            from sftlib.core import configure_local_storage
+            configure_local_storage(root)
+        if operation == "audit":
             from gridlib.audit import audit
             result = audit(root, bound, args.end_points)
             atomic_json(root / "audit.json", result)
             display(result, "Grid integrity audit", args.json)
-        elif operation == "pilot":
-            from gridlib.controller import pilot
-            try:
-                pilot(root, bound, args.settings.resolve(), args.end_points)
-            except BaseException as error:
-                atomic_json(root / "status.json", {"status": "pilot_failed", "error": str(error)})
-                raise
         elif operation == "run":
             from gridlib.controller import run
-            # Verify immutable backing bytes again before a long grid/resume.
-            binding(root, sft_work, settings, full=True)
+            from sftlib.core import configure_local_storage
+            configure_local_storage(root)
             try:
                 run(root, bound, args.settings.resolve(), args.end_points)
             except BaseException as error:
